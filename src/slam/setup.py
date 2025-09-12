@@ -28,6 +28,7 @@ setup(
     entry_points={
         'console_scripts': [
             'map_save = slam.map_save:main',
+            'map_auto_saver = slam.map_auto_saver:main',
         ],
     },
 )
