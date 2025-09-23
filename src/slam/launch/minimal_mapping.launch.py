@@ -13,14 +13,23 @@ def _setup(context):
     robot_name = LaunchConfiguration('robot_name', default='/').perform(context)
     sim = LaunchConfiguration('sim', default='false').perform(context)
 
+    # Helper to resolve a package share directory with a safe fallback
+    def resolve_pkg_dir(pkg_name: str, fallback: str) -> str:
+        try:
+            return get_package_share_directory(pkg_name)
+        except Exception:
+            return fallback
+
+    # Prefer installed package share directories; provide correct source fallbacks for dev runs
     if compiled == 'True':
-        periph_pkg = get_package_share_directory('peripherals')
-        slam_pkg = get_package_share_directory('slam')
-        controller_pkg = get_package_share_directory('controller')
+        periph_pkg = resolve_pkg_dir('peripherals', '/home/ubuntu/ros2_ws/src/peripherals')
+        slam_pkg = resolve_pkg_dir('slam', '/home/ubuntu/ros2_ws/src/slam')
+        controller_pkg = resolve_pkg_dir('controller', '/home/ubuntu/ros2_ws/src/driver/controller')
     else:
         periph_pkg = '/home/ubuntu/ros2_ws/src/peripherals'
         slam_pkg = '/home/ubuntu/ros2_ws/src/slam'
-        controller_pkg = '/home/ubuntu/ros2_ws/src/controller'
+        # Controller lives under driver/controller in this repo
+        controller_pkg = '/home/ubuntu/ros2_ws/src/driver/controller'
 
     lidar_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(periph_pkg, 'launch/lidar.launch.py')),
@@ -31,8 +40,9 @@ def _setup(context):
         PythonLaunchDescriptionSource(os.path.join(periph_pkg, 'launch/imu_filter.launch.py'))
     )
 
+    controller_launch_path = os.path.join(controller_pkg, 'launch', 'controller.launch.py')
     controller_launch = IncludeLaunchDescription(
-        PythonLaunchDescriptionSource(os.path.join(controller_pkg, 'launch/controller.launch.py')),
+        PythonLaunchDescriptionSource(controller_launch_path),
         launch_arguments={'sim': sim}.items()
     )
 
