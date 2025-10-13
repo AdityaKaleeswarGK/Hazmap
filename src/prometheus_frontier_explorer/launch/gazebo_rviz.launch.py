@@ -10,7 +10,7 @@ def generate_launch_description():
     turtlebot3_gazebo_pkg = get_package_share_directory('turtlebot3_gazebo')
 
     # Path to the original turtlebot3_world.launch.py
-    world_launch = os.path.join(turtlebot3_gazebo_pkg, 'launch', 'turtlebot3_world.launch.py')
+    world_launch = os.path.join(turtlebot3_gazebo_pkg, 'launch', 'turtlebot3_house.launch.py')
 
     # Include that launch file
     include_world = IncludeLaunchDescription(
