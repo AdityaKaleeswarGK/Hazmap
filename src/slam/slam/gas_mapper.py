@@ -3,7 +3,9 @@
 
 import math
 import time
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Dict, Any, List
+import json
+import ast
 
 import numpy as np
 
@@ -43,12 +45,23 @@ class GasMapper(Node):
         # Parameters
         self.declare_parameter('map_topic', 'map')
         # Multi-gas configuration: list of {name, topic, max_concentration}
-        self.declare_parameter('gases', [
-            {'name': 'methane', 'topic': 'gas/methane/ppm', 'max_concentration': 10000.0},
-            {'name': 'lpg', 'topic': 'gas/lpg/ppm', 'max_concentration': 10000.0},
-            {'name': 'co', 'topic': 'gas/co/ppm', 'max_concentration': 10000.0},
-            {'name': 'air_quality', 'topic': 'gas/air_quality/ppm', 'max_concentration': 1000.0},
-        ])
+        # self.declare_parameter('gases', [
+        #     {'name': 'methane', 'topic': 'gas/methane/ppm', 'max_concentration': 10000.0},
+        #     {'name': 'lpg', 'topic': 'gas/lpg/ppm', 'max_concentration': 10000.0},
+        #     {'name': 'co', 'topic': 'gas/co/ppm', 'max_concentration': 10000.0},
+        #     {'name': 'air_quality', 'topic': 'gas/air_quality/ppm', 'max_concentration': 1000.0},
+        # ])
+
+        raw_gases = self.declare_parameter('gases', '').get_parameter_value().string_value
+        self.gases = self._parse_list(raw_gases)
+        if not self.gases:
+            self.gases = [
+                {'name': 'methane', 'topic': 'gas/methane/ppm', 'max_concentration': 10000.0},
+                {'name': 'lpg', 'topic': 'gas/lpg/ppm', 'max_concentration': 10000.0},
+                {'name': 'co', 'topic': 'gas/co/ppm', 'max_concentration': 10000.0},
+                {'name': 'air_quality', 'topic': 'gas/air_quality/ppm', 'max_concentration': 1000.0},
+            ]
+        
         self.declare_parameter('publish_topic_prefix', 'gas_map')
         self.declare_parameter('map_frame', 'map')
         self.declare_parameter('base_frame', 'base_footprint')
@@ -108,6 +121,53 @@ class GasMapper(Node):
         self.get_logger().info(
             f"gas_mapper started; map: {self.map_topic}, gases: {list(self.gases.keys())} -> prefix: {self.publish_prefix}"
         )
+
+    def _parse_list(self, raw: Any) -> List[dict]:
+        """
+        Parse a list parameter provided as:
+        - YAML/JSON string,
+        - list[str] (multiline YAML passed through launch),
+        - or already a Python list.
+        Returns [] on failure.
+        """
+        try:
+            # Already a Python list
+            if isinstance(raw, list):
+                # Sometimes launch passes multi-line strings as list[str]
+                if raw and all(isinstance(x, str) for x in raw):
+                    try:
+                        import yaml
+                        return yaml.safe_load('\n'.join(raw)) or []
+                    except Exception:
+                        pass
+                    # Fallbacks
+                    s = '\n'.join(raw)
+                    try:
+                        return json.loads(s)
+                    except Exception:
+                        try:
+                            return ast.literal_eval(s)
+                        except Exception:
+                            return []
+                return raw
+
+            # Single string: YAML/JSON/Python-literal
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    import yaml
+                    return yaml.safe_load(raw) or []
+                except Exception:
+                    pass
+                try:
+                    return json.loads(raw)
+                except Exception:
+                    try:
+                        return ast.literal_eval(raw)
+                    except Exception:
+                        return []
+        except Exception as e:
+            self.get_logger().warn(f'Failed to parse "gases" parameter: {e}')
+        return []
 
     # --- Callbacks ---
     def _on_map(self, msg: OccupancyGrid) -> None:

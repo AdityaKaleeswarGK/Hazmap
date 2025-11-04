@@ -2,7 +2,7 @@
 """
 Read multiple MQ sensors via one ADS1115 at equal intervals and publish per-gas topics.
 
-Parameters (examples for 4 channels on ADS1115):
+Parameters:
 - i2c_addr: 0x48
 - i2c_bus: 1
 - rate_hz: 10.0  (all sensors read each cycle; equal cadence)
