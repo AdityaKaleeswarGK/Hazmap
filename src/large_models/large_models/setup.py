@@ -12,9 +12,12 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
-        (os.path.join('share', package_name, 'launch'), glob(os.path.join('launch', '*.*'))),
+    (os.path.join('share', package_name, 'launch'), glob(os.path.join('launch', '*.*'))),
+    (os.path.join('share', package_name, 'config'), glob(os.path.join('config', '*.*'))),
+        # Install model assets (e.g., best.pt) to the package share
+        (os.path.join('share', package_name, 'models'), glob(os.path.join('models', '*.*'))),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'ultralytics'],
     zip_safe=True,
     maintainer='ubuntu',
     maintainer_email='1270161395@qq.com',
@@ -26,6 +29,8 @@ setup(
             'vocal_detect = large_models.vocal_detect:main',
             'agent_process = large_models.agent_process:main',
             'tts_node = large_models.tts_node:main',
+            'yolo_infer = large_models.yolo_infer:main',
+            'gas_mapper = slam.gas_mapper:main',
             ],
     },
 )

@@ -1,0 +1,38 @@
+mq_ads1115_multi:
+  ros__parameters:
+    # ADS1115 I2C address (0x48 decimal 72)
+    i2c_addr: 72
+    # External I2C bus (Jetson/RPi common external header bus)
+    i2c_bus: 1
+    # Global sampling rate (Hz)
+    rate_hz: 2.0
+    # Sensors definition provided as YAML text; node treats this as a string and parses.
+    sensors: |
+      - name: methane
+        channel: 0
+        vref: 5.0
+        rl: 10000.0
+        r0: 12000.0
+        A: 1000.0
+        B: 1.5
+      - name: lpg
+        channel: 1
+        vref: 5.0
+        rl: 10000.0
+        r0: 12000.0
+        A: 1000.0
+        B: 1.5
+      - name: co
+        channel: 2
+        vref: 5.0
+        rl: 10000.0
+        r0: 12000.0
+        A: 1000.0
+        B: 1.5
+      - name: air_quality
+        channel: 3
+        vref: 5.0
+        rl: 10000.0
+        r0: 12000.0
+        A: 1000.0
+        B: 1.5
