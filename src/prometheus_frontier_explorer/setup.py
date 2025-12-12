@@ -15,7 +15,8 @@ setup(
         ('share/' + package_name + '/launch', [
             'launch/nav2_bringup.launch.py',
             'launch/gazebo_rviz.launch.py',
-            'launch/slam.launch.py'
+            'launch/slam.launch.py',
+            'launch/frontier_exploration.launch.py'
         ]),
 
         ('share/' + package_name + '/worlds', [
