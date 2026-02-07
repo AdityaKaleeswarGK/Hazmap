@@ -1,16 +1,35 @@
 <?xml version="1.0"?>
-<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd"
+             schematypens="http://www.w3.org/2001/XMLSchema"?>
+
 <package format="3">
   <name>hazmap</name>
   <version>0.0.0</version>
-  <description>TODO: Package description</description>
-  <maintainer email="adityakaleeswargk04@gmail.com">gk</maintainer>
-  <license>TODO: License declaration</license>
 
+  <description>Hazard mapping with SLAM Toolbox and Nav2</description>
+
+  <maintainer email="adityakaleeswargk04@gmail.com">gk</maintainer>
+  <license>Apache-2.0</license>
+
+  <!-- Core ROS -->
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+
+  <!-- SLAM + Navigation -->
+  <exec_depend>slam_toolbox</exec_depend>
+  <exec_depend>nav2_bringup</exec_depend>
+
+  <!-- Visualization -->
+  <exec_depend>rviz2</exec_depend>
+
+  <!-- Sensors (likely used) -->
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+
+  <!-- Python deps -->
   <exec_depend>python3-opencv</exec_depend>
 
+  <!-- Testing -->
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>
   <test_depend>ament_pep257</test_depend>
