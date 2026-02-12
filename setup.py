@@ -4,7 +4,7 @@ package_name = 'hazmap'
 
 setup(
     name=package_name,
-    version='0.0.0',
+    version='2.0.0',
     packages=find_packages(exclude=['test']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -13,24 +13,27 @@ setup(
         ('share/' + package_name, ['package.xml']),
 
         ('share/' + package_name + '/launch', [
-            'launch/nav2_bringup.launch.py',
-            'launch/gazebo_rviz.launch.py',
-            'launch/slam.launch.py'
+            'launch/hazmap.launch.py',
+        ]),
+
+        ('share/' + package_name + '/config', [
+            'config/hazmap_params.yaml',
+            'config/nav2_params.yaml',
+            'config/hazmap.rviz',
         ]),
     ],
-    install_requires=['setuptools'],
+    install_requires=['setuptools', 'matplotlib'],
     zip_safe=True,
     maintainer='gk',
     maintainer_email='adityakaleeswargk04@gmail.com',
-    description='TODO: Package description',
-    license='TODO: License declaration',
+    description='HazMap — Hazard Mapping & Coverage Path Planning for TurtleBot3 (ROS2 Humble)',
+    license='Apache-2.0',
     extras_require={
-        'test': [
-            'pytest',
-        ],
+        'test': ['pytest'],
     },
     entry_points={
         'console_scripts': [
+            'hazmap_node = hazmap.hazmap_core.hazmap_node:main',
         ],
     },
 )

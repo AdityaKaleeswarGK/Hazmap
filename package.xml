@@ -4,9 +4,9 @@
 
 <package format="3">
   <name>hazmap</name>
-  <version>0.0.0</version>
+  <version>2.0.0</version>
 
-  <description>Hazard mapping with SLAM Toolbox and Nav2</description>
+  <description>HazMap — Hazard Mapping and Coverage Path Planning for TurtleBot3 (ROS2 Humble)</description>
 
   <maintainer email="adityakaleeswargk04@gmail.com">gk</maintainer>
   <license>Apache-2.0</license>
@@ -14,20 +14,29 @@
   <!-- Core ROS -->
   <depend>rclpy</depend>
   <depend>std_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>std_srvs</depend>
 
-  <!-- SLAM + Navigation -->
-  <exec_depend>slam_toolbox</exec_depend>
+  <!-- Navigation -->
   <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_msgs</exec_depend>
 
-  <!-- Visualization -->
-  <exec_depend>rviz2</exec_depend>
+  <!-- SLAM -->
+  <exec_depend>slam_toolbox</exec_depend>
 
-  <!-- Sensors (likely used) -->
-  <exec_depend>sensor_msgs</exec_depend>
+  <!-- TF -->
   <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>tf2_geometry_msgs</exec_depend>
 
-  <!-- Python deps -->
-  <exec_depend>python3-opencv</exec_depend>
+  <!-- CV Pipeline (optional — only used when model/ has a YOLO model) -->
+  <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>message_filters</exec_depend>
+
+  <!-- Visualisation -->
+  <exec_depend>rviz2</exec_depend>
 
   <!-- Testing -->
   <test_depend>ament_copyright</test_depend>

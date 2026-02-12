@@ -1,0 +1,41 @@
+hazmap_node:
+  ros__parameters:
+    w: 0.750                # lap spacing
+    delta: 1                # sample spacing multiplier (every w*delta m)
+    sweep_direction: "x"    # "x" = vertical laps, "y" = horizontal laps
+    obstacle_buffer: 0.375  
+    frontier_min_cells: 2   # robust frontier: min boundary cells in B(s,w)
+    visualization_rate: 2.0  # Hz
+    debug_logging: true
+    use_hybrid_navigation: true
+    direct_nav_same_lap_only: false     
+    direct_nav_max_distance: 0.70       # max edge length for direct mode
+    direct_nav_linear_speed: 0.20       # m/s — faster with LiDAR safety
+    direct_nav_angular_speed: 1.00      # rad/s — responsive turning
+    direct_nav_xy_tolerance: 0.08       # arrival tolerance (m)
+    direct_nav_yaw_tolerance: 0.30      # heading tolerance before moving (rad)
+    direct_nav_timeout: 20.0            # seconds
+    direct_nav_fallback_to_nav2: true    # Nav2 takes over when direct hits obstacle
+    direct_nav_min_clearance: 0.18      # min obstacle clearance for direct mode
+
+    # ── Environmental Sensors ───────────────────────────────────────
+    # Each sensor has a name, unit, and priority (lower = higher priority)
+    sensor_names:      ["co",  "co2", "methane", "o2"]
+    sensor_units:      ["ppm", "ppm", "ppm",     "%"]
+    sensor_priorities: [1,     2,     3,         4]
+
+    # ── Visual Detection Classes ────────────────────────────────────
+    # YOLO-based detection: classes and their severity priorities
+    #   Severity order: fire (1) > smoke (2) > spills_shrouded (3)
+    #                   > translucent_spills (4) > coloured_spills (5)
+    detection_class_names: [
+      "coloured_spills",       # Class 1: Distinctly coloured spills
+      "fire",                  # Class 2: Fire in shrouded environments
+      "spills_shrouded",       # Class 3: Spills in shrouded environments
+      "smoke",                 # Class 4: Smoke
+      "translucent_spills"     # Class 5: Translucent spills
+    ]
+    detection_priorities: [5, 1, 3, 2, 4]
+
+    use_sim_time: true
+
