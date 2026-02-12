@@ -145,59 +145,6 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /hazmap/frontier_points
       Value: true
-
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: CO Sensors
-      Namespaces:
-        co_sensor: true
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /hazmap/co_markers
-      Value: true
-
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: CO2 Sensors
-      Namespaces:
-        co2_sensor: true
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /hazmap/co2_markers
-      Value: true
-
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: Methane Sensors
-      Namespaces:
-        methane_sensor: true
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /hazmap/methane_markers
-      Value: true
-
-    - Class: rviz_default_plugins/MarkerArray
-      Enabled: true
-      Name: O2 Sensors
-      Namespaces:
-        o2_sensor: true
-      Topic:
-        Depth: 5
-        Durability Policy: Volatile
-        History Policy: Keep Last
-        Reliability Policy: Reliable
-        Value: /hazmap/o2_markers
-      Value: true
-
     - Class: rviz_default_plugins/MarkerArray
       Enabled: true
       Name: Detections
@@ -211,7 +158,6 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /hazmap/detections
       Value: true
-
     - Class: rviz_default_plugins/TF
       Enabled: true
       Frame Timeout: 15

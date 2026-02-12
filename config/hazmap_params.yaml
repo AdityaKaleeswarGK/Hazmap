@@ -21,13 +21,10 @@ hazmap_node:
     # ── Environmental Sensors ───────────────────────────────────────
     # Each sensor has a name, unit, and priority (lower = higher priority)
     sensor_names:      ["co",  "co2", "methane", "o2"]
-    sensor_units:      ["ppm", "ppm", "ppm",     "%"]
-    sensor_priorities: [1,     2,     3,         4]
+    sensor_units:      ["ppm", "ppm", "ppm",     "ppm"]
+    sensor_priorities: [1,2,3,4]
 
     # ── Visual Detection Classes ────────────────────────────────────
-    # YOLO-based detection: classes and their severity priorities
-    #   Severity order: fire (1) > smoke (2) > spills_shrouded (3)
-    #                   > translucent_spills (4) > coloured_spills (5)
     detection_class_names: [
       "coloured_spills",       # Class 1: Distinctly coloured spills
       "fire",                  # Class 2: Fire in shrouded environments
