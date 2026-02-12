@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+dist/
+build/
+eggs/
+.eggs/
+
+# ROS2
+log/
+install/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Results
+results/
+
+# Model weights (user provides their own)
+model/*.pt
+model/*.onnx
+model/*.engine
+model/*.torchscript
+!model/.gitkeep
+
