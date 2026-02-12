@@ -11,7 +11,6 @@
 - [Features](#features)
 - [Project Structure](#project-structure)
 - [Prerequisites](#prerequisites)
-- [Installation](#installation)
 - [Configuration](#configuration)
   - [Sensors](#sensors)
   - [Visual Detection Classes](#visual-detection-classes)
@@ -23,7 +22,6 @@
 - [ROS 2 Topics & Services](#ros-2-topics--services)
 - [Output & Results](#output--results)
 - [Architecture](#architecture)
-- [License](#license)
 
 ---
 
@@ -100,37 +98,19 @@ hazmap/
 - **Nav2** (`nav2_bringup`)
 - **SLAM Toolbox** (`slam_toolbox`)
 - **Python 3.10+**
-
-### Python Dependencies
-
-```
-numpy >= 1.24.0
-scipy >= 1.11.0
-matplotlib >= 3.7.0
-ultralytics >= 8.0.0    # optional — only for CV detection pipeline
-opencv-python >= 4.8.0   # optional — only for CV detection pipeline
-```
-
----
-
 ## Installation
 
 ```bash
-# 1. Clone into your ROS 2 workspace
 cd ~/ros2_ws/src
 git clone <repo-url> hazmap
 
-# 2. Install Python dependencies
 pip install -r hazmap/requirements.txt
 
-# 3. Install ROS dependencies
 cd ~/ros2_ws
 rosdep install --from-paths src --ignore-src -r -y
 
-# 4. Build
 colcon build --packages-select hazmap --symlink-install
 
-# 5. Source
 source install/setup.bash
 ```
 
@@ -210,12 +190,6 @@ export TURTLEBOT3_MODEL=waffle
 ros2 launch hazmap hazmap.launch.py
 ```
 
-The launch file starts components with staggered delays:
-1. **Gazebo** — immediately
-2. **SLAM Toolbox** — after 5 s
-3. **Nav2** — after 8 s
-4. **HazMap node** — after 12 s
-5. **RViz** — after 14 s
 
 ### Start / Stop Coverage
 
@@ -324,10 +298,10 @@ The consolidated map fuses all sensor and detection data:
 │                     HazMapNode                          │
 │  (hazmap_core/hazmap_node.py)                           │
 │                                                         │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐  │
-│  │ MapManager   │  │ Progressive  │  │     RCG       │  │
-│  │              │  │  Sampler     │  │               │  │
-│  └──────┬───── ┘  └──────┬───────┘  └───────┬───────┘  │
+│  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐   │
+│  │ MapManager  │  │ Progressive  │  │     RCG       │   │
+│  │             │  │  Sampler     │  │               │   │
+│  └──────┬───── ┘  └──────┬───────┘  └───────┬───────┘   │
 │         │                │                   │          │
 │  ┌──────┴────────────────┴───────────────────┴───────┐  │
 │  │              WaypointSelector                     │  │
@@ -341,8 +315,8 @@ The consolidated map fuses all sensor and detection data:
 │  │   SensorManager     │  │   DetectionManager       │  │
 │  │ (pipeline/)         │  │ (pipeline/) [optional]   │  │
 │  │                     │  │                          │  │
-│  │  CO, CO₂, Methane,  │  │  YOLO → Depth → TF2     │  │
-│  │  O₂ simulation      │  │  → Map-frame pins       │  │
+│  │  CO, CO₂, Methane,  │  │  YOLO → Depth → TF2      │  │
+│  │  O₂ simulation      │  │  → Map-frame pins        │  │
 │  └──────────┬──────────┘  └────────────┬─────────────┘  │
 │             │                          │                │
 │             └──────────┬───────────────┘                │
@@ -364,8 +338,4 @@ The consolidated map fuses all sensor and detection data:
 8. On completion, all data is fused into a consolidated hazard impact map.
 
 ---
-
-## License
-
-Apache-2.0
 
