@@ -12,7 +12,7 @@ OBSTACLE_THRESHOLD = 50
 
 
 class MapManager:
-    def __init__(self, w: float = 0.15, obstacle_buffer: float = 0.12):
+    def __init__(self, w: float = 0.30, obstacle_buffer: float = 0.12):
         self.w = w
         self.obstacle_buffer = obstacle_buffer
 
@@ -23,11 +23,13 @@ class MapManager:
         self.resolution: float = 0.05
         self.origin_x: float = 0.0
         self.origin_y: float = 0.0
+        self.origin_yaw: float = 0.0
         self.grid_width: int = 0
         self.grid_height: int = 0
 
         self._old_origin_x: float = 0.0
         self._old_origin_y: float = 0.0
+        self._old_origin_yaw: float = 0.0
 
         self.robot_x: float = 0.0
         self.robot_y: float = 0.0
@@ -42,7 +44,8 @@ class MapManager:
         height: int,
         resolution: float,
         origin_x: float,
-        origin_y: float
+        origin_y: float,
+        origin_yaw: float = 0.0
     ):
         """Update the occupancy grid from a new /map message."""
         new_grid = np.array(data, dtype=np.int8).reshape((height, width))
@@ -54,8 +57,14 @@ class MapManager:
             or abs(origin_x - self.origin_x) > 1e-6
             or abs(origin_y - self.origin_y) > 1e-6
         )
+        
+        yaw_changed = abs(origin_yaw - self._old_origin_yaw) > 0.05
 
-        if map_changed and self.sampled_mask is not None:
+        if yaw_changed and self.sampled_mask is not None:
+            self.sampled_mask = np.zeros((height, width), dtype=bool)
+            self.covered_mask = np.zeros((height, width), dtype=bool)
+            print(f"WARNING: Map rotation shift detected ({self._old_origin_yaw:.3f} -> {origin_yaw:.3f}). Resetting coverage masks to prevent corruption.")
+        elif map_changed and self.sampled_mask is not None:
             self.sampled_mask = self._embed_sampled_mask(
                 width, height, resolution, origin_x, origin_y
             )
@@ -71,11 +80,13 @@ class MapManager:
 
         self._old_origin_x = self.origin_x
         self._old_origin_y = self.origin_y
+        self._old_origin_yaw = self.origin_yaw
 
         self.occupancy_grid = new_grid
         self.resolution = resolution
         self.origin_x = origin_x
         self.origin_y = origin_y
+        self.origin_yaw = origin_yaw
         self.grid_width = width
         self.grid_height = height
         self.map_received = True

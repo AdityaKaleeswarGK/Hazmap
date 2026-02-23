@@ -411,21 +411,20 @@ class DetectionManager:
     def get_detection_impact_grid(
         self,
         x_min: float, y_min: float,
-        x_max: float, y_max: float,
+        cols: int, rows: int,
+        resolution: float
     ) -> Optional[np.ndarray]:
         confirmed = self.get_confirmed_detections()
         if not confirmed:
             return None
 
-        cols = max(1, int((x_max - x_min) / self.grid_resolution))
-        rows = max(1, int((y_max - y_min) / self.grid_resolution))
         grid = np.zeros((rows, cols), dtype=np.float64)
 
-        splash_cells = max(1, int(self.splash_radius / self.grid_resolution))
+        splash_cells = max(1, int(self.splash_radius / resolution))
 
         for det in confirmed:
-            cc = int((det.map_x - x_min) / self.grid_resolution)
-            cr = int((det.map_y - y_min) / self.grid_resolution)
+            cc = int((det.map_x - x_min) / resolution)
+            cr = int((det.map_y - y_min) / resolution)
             weight = 1.0 / det.priority
             intensity = weight * min(det.detection_count / 10.0, 1.0)
 
@@ -435,7 +434,7 @@ class DetectionManager:
                     c = cc + dc
                     if not (0 <= r < rows and 0 <= c < cols):
                         continue
-                    dist = math.sqrt(dr * dr + dc * dc) * self.grid_resolution
+                    dist = math.sqrt(dr * dr + dc * dc) * resolution
                     if dist > self.splash_radius:
                         continue
                     falloff = math.exp(

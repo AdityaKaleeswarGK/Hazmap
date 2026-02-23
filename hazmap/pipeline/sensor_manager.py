@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import math
 import os
@@ -7,6 +8,7 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 from scipy import interpolate
+from scipy.ndimage import gaussian_filter
 
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -62,7 +64,7 @@ def _find_ros_workspace_root(start_path: str) -> Optional[str]:
 
 def _get_sensor_plot_cmap(sensor_name: str) -> str:
     """Return a per-sensor colormap for saved heatmaps."""
-    return _SENSOR_PLOT_CMAPS.get(sensor_name.lower(), _DEFAULT_SENSOR_PLOT_CMAP)
+    return _DEFAULT_SENSOR_PLOT_CMAP
 
 
 def _apply_light_plot_style(ax):
@@ -82,6 +84,47 @@ def _grid_to_mesh(extent, grid):
     xi = np.linspace(extent[0], extent[1], cols)
     yi = np.linspace(extent[2], extent[3], rows)
     return np.meshgrid(xi, yi)
+
+
+def _create_smooth_heatmap_grid(
+    readings: List[Tuple[float, float, float]],
+    x_min: float, y_min: float, x_max: float, y_max: float,
+    resolution: float, smooth_sigma: float = 3.0,
+) -> Optional[np.ndarray]:
+    if len(readings) < 4:
+        return None
+    
+    points = np.array([(r[0], r[1]) for r in readings])
+    values = np.array([r[2] for r in readings])
+    
+    cols = max(1, int((x_max - x_min) / resolution))
+    rows = max(1, int((y_max - y_min) / resolution))
+    
+    xi = np.linspace(x_min, x_max, cols)
+    yi = np.linspace(y_min, y_max, rows)
+    grid_x, grid_y = np.meshgrid(xi, yi)
+    
+    try:
+        rbf = interpolate.Rbf(
+            points[:, 0], points[:, 1], values,
+            function='thin_plate', smooth=0.1,
+        )
+        grid = rbf(grid_x, grid_y)
+    except Exception:
+        grid = interpolate.griddata(
+            points, values, (grid_x, grid_y), method='cubic'
+        )
+        nan_mask = np.isnan(grid)
+        if nan_mask.any():
+            nearest = interpolate.griddata(
+                points, values, (grid_x, grid_y), method='nearest'
+            )
+            grid[nan_mask] = nearest[nan_mask]
+    
+    if smooth_sigma > 0:
+        grid = gaussian_filter(grid, sigma=smooth_sigma, mode='nearest')
+    
+    return grid
 
 
 class SensorSimulator:
@@ -168,7 +211,7 @@ class SensorSimulator:
 
         self.readings.append((x, y, value))
 
-    def get_interpolated_grid(self) -> Optional[np.ndarray]:
+    def get_interpolated_grid(self, smooth_sigma: float = 2.0) -> Optional[np.ndarray]:
         if len(self.readings) < 3:
             return None
 
@@ -176,26 +219,28 @@ class SensorSimulator:
         grid = np.full((self.rows, self.cols), np.nan)
         grid[mask] = self.sum_grid[mask] / self.count_grid[mask]
 
-        if np.isnan(grid).any():
-            xi = np.linspace(self.x_min, self.x_max, self.cols)
-            yi = np.linspace(self.y_min, self.y_max, self.rows)
-            grid_x, grid_y = np.meshgrid(xi, yi)
+        xi = np.linspace(self.x_min, self.x_max, self.cols)
+        yi = np.linspace(self.y_min, self.y_max, self.rows)
+        grid_x, grid_y = np.meshgrid(xi, yi)
 
-            points = np.array([(r[0], r[1]) for r in self.readings])
-            values = np.array([r[2] for r in self.readings])
+        points = np.array([(r[0], r[1]) for r in self.readings])
+        values = np.array([r[2] for r in self.readings])
 
-            interp = interpolate.griddata(
-                points, values, (grid_x, grid_y), method='linear'
+        interp = interpolate.griddata(
+            points, values, (grid_x, grid_y), method='linear'
+        )
+        nan_mask = np.isnan(grid)
+        grid[nan_mask] = interp[nan_mask]
+
+        still_nan = np.isnan(grid)
+        if still_nan.any():
+            nearest = interpolate.griddata(
+                points, values, (grid_x, grid_y), method='nearest'
             )
-            nan_mask = np.isnan(grid)
-            grid[nan_mask] = interp[nan_mask]
+            grid[still_nan] = nearest[still_nan]
 
-            still_nan = np.isnan(grid)
-            if still_nan.any():
-                nearest = interpolate.griddata(
-                    points, values, (grid_x, grid_y), method='nearest'
-                )
-                grid[still_nan] = nearest[still_nan]
+        if smooth_sigma > 0:
+            grid = gaussian_filter(grid, sigma=smooth_sigma, mode='nearest')
 
         return grid
 
@@ -274,13 +319,22 @@ class SensorManager:
             )
 
     @staticmethod
-    def _normalize_grid_01(grid: np.ndarray) -> Optional[np.ndarray]:
-        gmin = float(np.nanmin(grid))
-        gmax = float(np.nanmax(grid))
-        val_range = gmax - gmin
-        if val_range <= 1e-12:
-            return None
-        return (grid - gmin) / val_range
+    def _zscore_grid_to_01(grid: np.ndarray, std_clip: float = 3.0) -> Optional[np.ndarray]:
+        """Converts raw readings to a Z-score anomaly map (0.0 to 1.0)."""
+        mean_val = float(np.nanmean(grid))
+        std_val = float(np.nanstd(grid))
+        if std_val <= 1e-12:
+            return np.zeros_like(grid) # Uniform room, no anomalies
+        
+        # Calculate Z-Scores
+        z_scores = (grid - mean_val) / std_val
+        
+        # We only care about positive anomalies (spikes above the room average).
+        # Clip anything below average to 0.0, and cap extreme spikes at std_clip.
+        z_scores_clipped = np.clip(z_scores, 0.0, std_clip)
+        
+        # Normalize the 0->std_clip range to 0.0->1.0 for the colormap.
+        return z_scores_clipped / std_clip
 
     def sample_and_publish(self):
         if not self.node.coverage_running:
@@ -303,15 +357,42 @@ class SensorManager:
     #  save_results — now accepts an optional DetectionManager
     # ════════════════════════════════════════════════════════════════
 
+    def _create_map_aligned_grid(self, readings: List[Tuple[float, float, float]],
+                                 smooth_sigma: float = 2.0) -> Optional[np.ndarray]:
+        """Interpolates sensor readings directly onto the map manager's occupancy grid."""
+        mm = self.node.map_manager
+        if mm.occupancy_grid is None or len(readings) < 3:
+            return None
+
+        xi = np.linspace(mm.origin_x, mm.origin_x + mm.grid_width * mm.resolution, mm.grid_width)
+        yi = np.linspace(mm.origin_y, mm.origin_y + mm.grid_height * mm.resolution, mm.grid_height)
+        grid_x, grid_y = np.meshgrid(xi, yi)
+
+        points = np.array([(r[0], r[1]) for r in readings])
+        values = np.array([r[2] for r in readings])
+
+        grid = np.full((mm.grid_height, mm.grid_width), np.nan)
+
+        interp = interpolate.griddata(points, values, (grid_x, grid_y), method='linear')
+        grid[np.isnan(grid)] = interp[np.isnan(grid)]
+
+        still_nan = np.isnan(grid)
+        if still_nan.any():
+            nearest = interpolate.griddata(points, values, (grid_x, grid_y), method='nearest')
+            grid[still_nan] = nearest[still_nan]
+
+        if smooth_sigma > 0:
+            grid = gaussian_filter(grid, sigma=smooth_sigma, mode='nearest')
+
+        return grid
+
     def save_results(self, logger, detection_manager=None):
-        """Generate heatmap PNGs.  Guarded against double-save."""
+        """Generate perfectly map-aligned heatmap PNGs."""
         if self._results_saved:
             return
         self._results_saved = True
 
-        has_sensor_data = any(
-            len(sim.readings) > 0 for sim in self.simulators.values()
-        )
+        has_sensor_data = any(len(sim.readings) > 0 for sim in self.simulators.values())
         has_detection_data = (
             detection_manager is not None
             and detection_manager.enabled
@@ -327,11 +408,9 @@ class SensorManager:
             matplotlib.use('Agg')
             import matplotlib.pyplot as plt
             from matplotlib.colors import LinearSegmentedColormap
+            import copy
         except ImportError:
-            logger.error(
-                'matplotlib not installed — cannot save heatmaps. '
-                'Install with: pip install matplotlib'
-            )
+            logger.error('matplotlib not installed — cannot save heatmaps. Install with: pip install matplotlib')
             return
 
         plt.style.use('default')
@@ -341,9 +420,7 @@ class SensorManager:
         if ws_root is not None:
             base_results_dir = os.path.join(ws_root, 'results')
         else:
-            project_dir = os.path.dirname(
-                os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            )
+            project_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
             base_results_dir = os.path.join(project_dir, 'results')
 
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -352,106 +429,141 @@ class SensorManager:
 
         logger.info(f'Saving HazMap results to {results_dir}')
 
-        colors_list = ['#fee5d9', '#fcae91', '#fb6a4a', '#cb181d', '#67000d']
-        impact_cmap = LinearSegmentedColormap.from_list(
-            'impact', colors_list, N=256
-        )
+        csv_path = os.path.join(results_dir, 'gas_concentrations.csv')
+        with open(csv_path, 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['sensor', 'x', 'y', 'concentration'])
+            for name, sim in self.simulators.items():
+                for x, y, val in sim.readings:
+                    writer.writerow([name, f'{x:.4f}', f'{y:.4f}', f'{val:.6f}'])
+        logger.info(f'  Saved {csv_path}')
 
-        # ── Per-sensor heatmaps ─────────────────────────────────────
+        mm = self.node.map_manager
+        if mm.occupancy_grid is None:
+            logger.warn('Occupancy grid is missing, cannot generate visual maps.')
+            return
+
+        map_extent = [
+            mm.origin_x, mm.origin_x + mm.grid_width * mm.resolution,
+            mm.origin_y, mm.origin_y + mm.grid_height * mm.resolution,
+        ]
+
+        map_img = np.full(mm.occupancy_grid.shape, 1.0)  # Unknown is white to remove grey borders
+        map_img[mm.occupancy_grid == 0] = 1.0            # Free is white
+        map_img[mm.occupancy_grid >= 50] = 0.0           # Obstacle is black
+
+        free_mask = (mm.occupancy_grid == 0)  # Interpolate gas fully across known free space
+
+        def add_scale_and_stats(ax_obj, raw_grid, free_space_mask, extent, unit_label=''):
+            raw_masked = np.where(free_space_mask, raw_grid, np.nan)
+            valid = raw_masked[~np.isnan(raw_masked)]
+            if len(valid) > 0:
+                v_min, v_max, v_mean = np.nanmin(valid), np.nanmax(valid), np.nanmean(valid)
+                v_std = np.nanstd(valid)
+                ul = f" ({unit_label})" if unit_label else ""
+                stats_text = f"Stats{ul}:\nMin: {v_min:.2f}\nMax: {v_max:.2f}\nMean: {v_mean:.2f}\nStd: {v_std:.2f}"
+                props = dict(boxstyle='round,pad=0.4', facecolor='white', alpha=0.85, edgecolor='#cbd5e1')
+                ax_obj.text(0.02, 0.98, stats_text, transform=ax_obj.transAxes, fontsize=10,
+                        verticalalignment='top', bbox=props, zorder=10)
+            
+            map_w = extent[1] - extent[0]
+            scale_length = 1.0 if map_w < 10 else 5.0
+            if map_w >= 20: scale_length = 10.0
+            
+            sx = extent[0] + map_w * 0.05
+            sy = extent[2] + (extent[3] - extent[2]) * 0.05
+            tick_h = map_w * 0.01
+            
+            ax_obj.plot([sx, sx + scale_length], [sy, sy], color='black', linewidth=3, zorder=10)
+            ax_obj.plot([sx, sx], [sy - tick_h, sy + tick_h], color='black', linewidth=1.5, zorder=10)
+            ax_obj.plot([sx + scale_length, sx + scale_length], [sy - tick_h, sy + tick_h], color='black', linewidth=1.5, zorder=10)
+            ax_obj.text(sx + scale_length/2, sy + tick_h * 1.5, f'{scale_length} m', 
+                    color='black', fontsize=10, ha='center', va='bottom', fontweight='bold', zorder=10,
+                    bbox=dict(facecolor='white', alpha=0.6, edgecolor='none', pad=0.1))
+
         grids_for_consolidated = {}
         for name, sim in self.simulators.items():
-            grid = sim.get_interpolated_grid()
-            if grid is None:
-                logger.warn(
-                    f'Sensor "{name}": not enough data for heatmap.'
-                )
+            if len(sim.readings) < 3:
                 continue
 
-            normalized = self._normalize_grid_01(grid)
+            grid = self._create_map_aligned_grid(sim.readings)
+            if grid is None:
+                continue
+
+            normalized = self._zscore_grid_to_01(grid)
             if normalized is None:
-                logger.warn(
-                    f'Sensor "{name}": degenerate grid range; skipping.'
-                )
                 continue
 
             grids_for_consolidated[name] = normalized
 
-            fig, ax = plt.subplots(1, 1, figsize=(11, 9), facecolor='white')
-            sensor_cmap = plt.get_cmap(_get_sensor_plot_cmap(name))
-            extent = [sim.x_min, sim.x_max, sim.y_min, sim.y_max]
-            X, Y = _grid_to_mesh(extent, normalized)
-            levels = np.linspace(0.0, 1.0, 20)
-            cf = ax.contourf(
-                X, Y, normalized, levels=levels, cmap=sensor_cmap,
-                vmin=0.0, vmax=1.0, antialiased=True, alpha=0.95,
+            fig = plt.figure(figsize=(10, 10), facecolor='white')
+            ax = fig.add_axes((0.0, 0.0, 1.0, 1.0))
+            ax.set_facecolor('white')
+
+            sensor_cmap = copy.copy(plt.get_cmap(_get_sensor_plot_cmap(name)))
+            sensor_cmap.set_bad(color='white', alpha=0.0)
+
+            ax.imshow(map_img, origin='lower', extent=map_extent, cmap='gray', vmin=0.0, vmax=1.0)
+            masked_grid = np.where(free_mask, normalized, np.nan)
+
+            im = ax.imshow(
+                masked_grid, origin='lower', extent=map_extent,
+                cmap=sensor_cmap, vmin=0.0, vmax=1.0,
+                aspect='equal', interpolation='bilinear',
             )
-            cbar = plt.colorbar(cf, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label(f'{sim.config.name.upper()} (normalized 0-1)')
-            ax.set_title(
-                f'{sim.config.name.upper()} Concentration Heatmap (0-1)'
-            )
+
+            # --- TOPOGRAPHIC CONTOURS ---
+            if np.nanmax(masked_grid) > 0.1:
+                ax.contour(
+                    masked_grid, levels=6, origin='lower', extent=map_extent,
+                    colors='black', alpha=0.35, linewidths=0.8
+                )
+            
+            add_scale_and_stats(ax, grid, free_mask, map_extent, sim.config.unit)
+
+            ax.set_title(f'HazMap — {name.upper()} Concentration Map\n(Z-Score Anomaly)', pad=15)
             ax.set_xlabel('X (m)')
             ax.set_ylabel('Y (m)')
-            self._draw_obstacle_outline(ax)
-
-            vals = normalized[np.isfinite(normalized)]
-            if vals.size:
-                stats = (
-                    f"Min: {float(np.min(vals)):.2f}\n"
-                    f"Max: {float(np.max(vals)):.2f}\n"
-                    f"Mean: {float(np.mean(vals)):.2f}"
-                )
-                ax.text(
-                    0.015, 0.97, stats, transform=ax.transAxes, va='top',
-                    fontsize=9,
-                    bbox=dict(
-                        boxstyle='round', facecolor='white', alpha=0.75
-                    ),
-                )
             _apply_light_plot_style(ax)
 
+            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            unit_label = f' ({sim.config.unit})' if sim.config.unit else ''
+            cbar.set_label(f'Concentration{unit_label}', rotation=270, labelpad=15)
+
             path = os.path.join(results_dir, f'{name}_heatmap.png')
-            fig.savefig(path, dpi=300, bbox_inches='tight', facecolor='white')
+            fig.savefig(path, dpi=200, pad_inches=0, facecolor='white')
             plt.close(fig)
             logger.info(f'  Saved {path}')
 
-        # ── Detection pin graph ─────────────────────────────────────
         if has_detection_data:
-            self._save_detection_pins(
-                detection_manager, results_dir, logger,
-            )
+            self._save_detection_pins(detection_manager, results_dir, logger, map_extent, map_img)
 
-        # ── Consolidated + connectivity ─────────────────────────────
         if grids_for_consolidated or has_detection_data:
+            # Professional academic continuous heat palette
+            colors_list = [
+                '#ffffff', '#e0f2fe', '#7dd3fc', '#0ea5e9', '#4f46e5',
+                '#7e22ce', '#d946ef', '#f43f5e', '#f97316', '#eab308'
+            ]
+            impact_cmap = LinearSegmentedColormap.from_list('impact', colors_list, N=256)
             self._save_consolidated(
                 grids_for_consolidated, results_dir, impact_cmap, logger,
-                detection_manager=detection_manager,
+                map_extent, map_img, free_mask, detection_manager=detection_manager
             )
             self._save_connectivity_graph_figure(
-                results_dir, logger,
-                detection_manager=detection_manager,
+                results_dir, logger, map_extent, map_img, detection_manager=detection_manager
             )
 
-    # ─── Detection pin graph ────────────────────────────────────────
-
-    def _save_detection_pins(self, det_mgr, results_dir, logger):
-        """Save a map-view figure with coloured pins for each detection."""
-        try:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-            from matplotlib.lines import Line2D
-        except ImportError:
-            return
+    def _save_detection_pins(self, det_mgr, results_dir, logger, map_extent, map_img):
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
 
         confirmed = det_mgr.get_confirmed_detections()
         if not confirmed:
             return
 
         fig, ax = plt.subplots(1, 1, figsize=(12, 10), facecolor='white')
-        self._draw_obstacle_outline(ax)
+        ax.imshow(map_img, origin='lower', extent=map_extent, cmap='gray', vmin=0.0, vmax=1.0)
 
-        # Group by class for legend
         class_groups: dict = {}
         for det in confirmed:
             class_groups.setdefault(det.cls_name, []).append(det)
@@ -461,15 +573,13 @@ class SensorManager:
             color = det_mgr._get_class_color(cls_name)
             xs = [d.map_x for d in dets]
             ys = [d.map_y for d in dets]
-            sizes = [
-                30 + min(d.detection_count, 20) * 5 for d in dets
-            ]
+            sizes = [30 + min(d.detection_count, 20) * 5 for d in dets]
+            
             ax.scatter(
                 xs, ys, s=sizes, c=[color],
                 edgecolors='black', linewidths=0.8,
                 zorder=5, alpha=0.9,
             )
-            # Splash circles
             for d in dets:
                 circle = plt.Circle(
                     (d.map_x, d.map_y), det_mgr.splash_radius,
@@ -500,43 +610,15 @@ class SensorManager:
         plt.close(fig)
         logger.info(f'  Saved {path}')
 
-    # ─── Obstacle outline helper ────────────────────────────────────
-
-    def _draw_obstacle_outline(self, ax):
-        mm = self.node.map_manager
-        if mm.occupancy_grid is None:
-            return
-        obstacle = (mm.occupancy_grid >= 50).astype(float)
-        extent = [
-            mm.origin_x,
-            mm.origin_x + mm.grid_width * mm.resolution,
-            mm.origin_y,
-            mm.origin_y + mm.grid_height * mm.resolution,
-        ]
-        X, Y = _grid_to_mesh(extent, obstacle)
-        ax.contour(
-            X, Y, obstacle, levels=[0.5],
-            colors=['#9ca3af'], linewidths=0.8, alpha=0.75,
-        )
-
-    # ─── Connectivity graph ─────────────────────────────────────────
-
-    def _save_connectivity_graph_figure(
-        self, results_dir, logger, detection_manager=None,
-    ):
-        try:
-            import matplotlib
-            matplotlib.use('Agg')
-            import matplotlib.pyplot as plt
-        except ImportError:
-            return
+    def _save_connectivity_graph_figure(self, results_dir, logger, map_extent, map_img, detection_manager=None):
+        import matplotlib.pyplot as plt
 
         rcg = self.node.rcg
         if not rcg.nodes:
             return
 
         fig, ax = plt.subplots(1, 1, figsize=(12, 10), facecolor='white')
-        self._draw_obstacle_outline(ax)
+        ax.imshow(map_img, origin='lower', extent=map_extent, cmap='gray', vmin=0.0, vmax=1.0)
 
         drawn = set()
         for node in rcg.nodes.values():
@@ -573,7 +655,6 @@ class SensorManager:
                 px[-1], py[-1], s=55, c='#dc2626', zorder=5, label='End',
             )
 
-        # Overlay detection pins on connectivity graph
         if detection_manager is not None and detection_manager.enabled:
             dets = detection_manager.get_confirmed_detections()
             if dets:
@@ -597,21 +678,16 @@ class SensorManager:
         plt.close(fig)
         logger.info(f'  Saved {path}')
 
-    # ─── Consolidated impact map ────────────────────────────────────
-
     def _save_consolidated(
         self, grids, results_dir, cmap, logger,
-        detection_manager=None,
+        map_extent, map_img, free_mask, detection_manager=None, smooth_sigma: float = 2.5
     ):
-        """Weighted combination of sensor + detection data with danger contours."""
-        import matplotlib
-        matplotlib.use('Agg')
         import matplotlib.pyplot as plt
+        import copy
 
         total_weight = 0.0
         combined = None
 
-        # ── Sensor grids ──
         for name, grid in grids.items():
             cfg = self.simulators[name].config
             weight = 1.0 / cfg.priority
@@ -620,114 +696,137 @@ class SensorManager:
             if combined is None:
                 combined = weight * grid
             else:
-                min_rows = min(combined.shape[0], grid.shape[0])
-                min_cols = min(combined.shape[1], grid.shape[1])
-                combined = combined[:min_rows, :min_cols]
-                combined += weight * grid[:min_rows, :min_cols]
+                combined += weight * grid
 
-        # ── Detection impact grid ──
         if detection_manager is not None and detection_manager.enabled:
             confirmed = detection_manager.get_confirmed_detections()
             if confirmed:
-                ref_sim = next(iter(self.simulators.values()), None)
-                if ref_sim is not None:
-                    det_grid = detection_manager.get_detection_impact_grid(
-                        ref_sim.x_min, ref_sim.y_min,
-                        ref_sim.x_max, ref_sim.y_max,
-                    )
-                    if det_grid is not None:
-                        avg_pri = np.mean(
-                            [d.priority for d in confirmed]
-                        )
-                        det_weight = 1.0 / max(avg_pri, 1.0)
-                        total_weight += det_weight
+                mm = self.node.map_manager
+                det_grid = detection_manager.get_detection_impact_grid(
+                    map_extent[0], map_extent[2],
+                    mm.grid_width, mm.grid_height,
+                    mm.resolution
+                )
+                if det_grid is not None:
+                    avg_pri = np.mean([d.priority for d in confirmed])
+                    det_weight = 1.0 / max(avg_pri, 1.0)
+                    total_weight += det_weight
 
-                        if combined is None:
-                            combined = det_weight * det_grid
-                        else:
-                            min_rows = min(
-                                combined.shape[0], det_grid.shape[0]
-                            )
-                            min_cols = min(
-                                combined.shape[1], det_grid.shape[1]
-                            )
-                            combined = combined[:min_rows, :min_cols]
-                            combined += (
-                                det_weight
-                                * det_grid[:min_rows, :min_cols]
-                            )
+                    if combined is None:
+                        combined = det_weight * det_grid
+                    else:
+                        combined += det_weight * det_grid
 
         if combined is None or total_weight == 0:
             return
 
         combined /= total_weight
 
-        ref_sim = next(iter(self.simulators.values()))
-        extent = [ref_sim.x_min, ref_sim.x_max, ref_sim.y_min, ref_sim.y_max]
-
-        fig, ax = plt.subplots(1, 1, figsize=(14, 12), facecolor='white')
-        X, Y = _grid_to_mesh(extent, combined)
-        levels = np.linspace(0.0, 1.0, 24)
-        cf = ax.contourf(
-            X, Y, combined, levels=levels, cmap=cmap,
-            vmin=0.0, vmax=1.0, antialiased=True, alpha=0.96,
+        fig = plt.figure(figsize=(10, 10), facecolor='white')
+        ax = fig.add_axes((0.0, 0.0, 1.0, 1.0))
+        ax.set_facecolor('white')
+        
+        cmap = copy.copy(cmap)
+        cmap.set_bad(color='white', alpha=0.0)
+        
+        if smooth_sigma > 0:
+            combined = gaussian_filter(combined, sigma=smooth_sigma, mode='nearest')
+        
+        ax.imshow(map_img, origin='lower', extent=map_extent, cmap='gray', vmin=0.0, vmax=1.0)
+        
+        masked_combined = np.where(free_mask, combined, np.nan)
+        
+        max_comb = np.nanmax(masked_combined)
+        dyn_vmax = max(0.1, float(max_comb))
+        
+        im = ax.imshow(
+            masked_combined, origin='lower', extent=map_extent,
+            cmap=cmap, vmin=0.0, vmax=dyn_vmax,
+            aspect='equal', interpolation='bilinear',
         )
-
-        contour_levels = [0.5, 0.7, 0.9]
-        contour_colors = ['#fb6a4a', '#cb181d', '#67000d']
-        cs = ax.contour(
-            X, Y, combined, levels=contour_levels,
-            colors=contour_colors, linewidths=1.2,
-        )
-        ax.clabel(cs, fmt={0.5: '50%', 0.7: '70%', 0.9: '90%'}, fontsize=9)
-
-        # Overlay detection pins on the consolidated map
+        
+        if max_comb > 0.1:
+            ax.contour(
+                masked_combined, levels=10, origin='lower', extent=map_extent,
+                colors='black', alpha=0.4, linewidths=0.6
+            )
+            
+        mm = self.node.map_manager
+        
+        # Draw Priority-Based Peak Markers
+        peaks = []
+        for name, grid in grids.items():
+            cfg = self.simulators[name].config
+            valid_grid = np.where(free_mask, grid, np.nan)
+            if np.nanmax(valid_grid) > 0.1:
+                max_idx = np.nanargmax(valid_grid)
+                flat_y, flat_x = np.unravel_index(max_idx, valid_grid.shape)
+                cx = map_extent[0] + (flat_x / mm.grid_width) * (map_extent[1] - map_extent[0])
+                cy = map_extent[2] + (flat_y / mm.grid_height) * (map_extent[3] - map_extent[2])
+                peaks.append({'label': name.upper(), 'x': cx, 'y': cy, 'pri': cfg.priority})
+                
         if detection_manager is not None and detection_manager.enabled:
             dets = detection_manager.get_confirmed_detections()
-            for det in dets:
-                color = detection_manager._get_class_color(det.cls_name)
-                ax.scatter(
-                    det.map_x, det.map_y, s=50,
-                    c=[color], marker='v',
-                    edgecolors='black', linewidths=0.6,
-                    zorder=10, alpha=0.95,
+            if dets:
+                det_grid = detection_manager.get_detection_impact_grid(
+                    map_extent[0], map_extent[2], mm.grid_width, mm.grid_height, mm.resolution
                 )
-                # Splash circle
-                circle = plt.Circle(
-                    (det.map_x, det.map_y),
-                    detection_manager.splash_radius,
-                    color=color, alpha=0.12, linewidth=0.5,
-                    edgecolor=color, linestyle='--',
-                )
-                ax.add_patch(circle)
+                if det_grid is not None:
+                    valid_det = np.where(free_mask, det_grid, np.nan)
+                    if np.nanmax(valid_det) > 0.0:
+                        max_idx = np.nanargmax(valid_det)
+                        flat_y, flat_x = np.unravel_index(max_idx, valid_det.shape)
+                        cx = map_extent[0] + (flat_x / mm.grid_width) * (map_extent[1] - map_extent[0])
+                        cy = map_extent[2] + (flat_y / mm.grid_height) * (map_extent[3] - map_extent[2])
+                        avg_pri = np.mean([d.priority for d in dets])
+                        peaks.append({'label': 'DETECTION', 'x': cx, 'y': cy, 'pri': avg_pri})
+                
+        # Sort so lower priority (higher number) is drawn first, high priority on top
+        peaks.sort(key=lambda p: p['pri'], reverse=True)
+        
+        # Plot peaks with shades based on priority (1 = red, 2 = orange, 3 = yellow, 4+ = cyan)
+        priority_colors = {1: '#e31a1c', 2: '#f97316', 3: '#eab308'}
+        
+        for p in peaks:
+            # Determine color and size by priority
+            pri_int = max(1, int(round(p['pri'])))
+            p_color = priority_colors.get(pri_int, '#06b6d4')  # default cyan for low priority
+            p_size = max(6, 16 - pri_int * 2)  # PRI 1 = 14, PRI 2 = 12, etc.
+            
+            # Draw marker
+            ax.plot(p['x'], p['y'], marker='o', color=p_color, markersize=p_size, 
+                    markeredgecolor='black', markeredgewidth=1.2, zorder=20)
+            
+            # Draw label (Cleaner styling for academic paper)
+            bbox_props = dict(boxstyle="round,pad=0.25", fc="white", ec='black', alpha=0.85, lw=0.8)
+            ax.text(p['x'], p['y'] + (map_extent[3]-map_extent[2])*0.025, f"{p['label']}", 
+                    color='black', fontsize=8, fontweight='bold', ha='center', va='bottom', 
+                    bbox=bbox_props, zorder=25)
 
-        cbar = plt.colorbar(cf, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label('Weighted Hazard Impact Level (0-1)')
-        ax.set_title('HazMap — Consolidated Hazard Impact Map (normalized 0-1)')
+        # Add scale bar
+        map_w = map_extent[1] - map_extent[0]
+        scale_length = 1.0 if map_w < 10 else 5.0
+        if map_w >= 20: scale_length = 10.0
+        sx = map_extent[0] + map_w * 0.05
+        sy = map_extent[2] + (map_extent[3] - map_extent[2]) * 0.05
+        tick_h = map_w * 0.01
+        ax.plot([sx, sx + scale_length], [sy, sy], color='black', linewidth=3, zorder=10)
+        ax.plot([sx, sx], [sy - tick_h, sy + tick_h], color='black', linewidth=1.5, zorder=10)
+        ax.plot([sx + scale_length, sx + scale_length], [sy - tick_h, sy + tick_h], color='black', linewidth=1.5, zorder=10)
+        ax.text(sx + scale_length/2, sy + tick_h * 1.5, f'{scale_length} m', 
+                color='black', fontsize=10, ha='center', va='bottom', fontweight='bold', zorder=10,
+                bbox=dict(facecolor='white', alpha=0.6, edgecolor='none', pad=0.1))
+        
+        ax.set_title('HazMap — Consolidated Hazard Map\n(Actionable Danger Zones)', pad=15)
         ax.set_xlabel('X (m)')
         ax.set_ylabel('Y (m)')
-        self._draw_obstacle_outline(ax)
         _apply_light_plot_style(ax)
 
-        # Legend info
-        info_parts = []
-        for cfg in self.configs:
-            if cfg.name in grids:
-                info_parts.append(f'{cfg.name}(w={1.0/cfg.priority:.2f})')
-        if detection_manager is not None and detection_manager.enabled:
-            n_det = len(detection_manager.get_confirmed_detections())
-            if n_det > 0:
-                info_parts.append(f'detections({n_det} objects)')
-        sensor_info = ', '.join(info_parts)
-        ax.text(
-            0.02, 0.02, f'Sources: {sensor_info}',
-            transform=ax.transAxes, fontsize=7,
-            verticalalignment='bottom',
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.7),
-        )
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label('Relative Hazard Impact Severity', rotation=270, labelpad=15)
 
         path = os.path.join(results_dir, 'consolidated_impact.png')
-        fig.savefig(path, dpi=300, bbox_inches='tight', facecolor='white')
+        fig.savefig(path, dpi=200, pad_inches=0, facecolor='white')
         plt.close(fig)
         logger.info(f'  Saved {path}')
 

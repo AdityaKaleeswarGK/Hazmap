@@ -47,8 +47,9 @@ def generate_launch_description():
     gazebo = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(turtlebot3_gazebo_dir, 'launch',
-                         'turtlebot3_world.launch.py')
+                         'turtlebot3_house.launch.py')
         ),
+        launch_arguments={'x_pose': '-1.5', 'y_pose': '1.5'}.items(),
     )
     # ── SLAM Toolbox (delay 5 s for Gazebo) ─────────────────────
     slam = TimerAction(

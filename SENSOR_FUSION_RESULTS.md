@@ -1,0 +1,9 @@
+# Sensor Sampling, Fusion, and Result Interpretation
+
+Sensor readings are sampled at a fixed rate while coverage is running (4 Hz). At each tick, the system takes the robot’s current (x, y) pose and queries each configured sensor model for a scalar value. In simulation this value is generated from a deterministic set of spatial “hotspots” (seeded per sensor name) plus a low-amplitude spatial sinusoid and Gaussian noise, then clipped to that sensor’s configured physical range.
+
+Each reading is accumulated into a per-sensor 2D grid (fixed resolution, e.g., 0.10 m/cell). Instead of writing only one cell, the reading is “splashed” into a local radius using a Gaussian falloff: nearby cells receive a weighted contribution into a sum grid and a count grid. The resulting concentration surface is the weighted average (sum/count). For visualization, any remaining gaps are interpolated (linear, then nearest as a fallback).
+
+Fusion produces a single normalized hazard map. Each sensor grid is normalized to [0, 1] using min–max scaling over finite cells, then weighted by inverse priority (weight = 1/priority). The fused grid is the weighted sum of all contributing layers divided by the total weight (optional detection impact is treated as an additional weighted layer).
+
+Results are saved under `/home/gk/ros2_ws/results/<timestamp>/`. For the latest run (`20260212_134238`), `co_heatmap.png`, `co2_heatmap.png`, `methane_heatmap.png`, and `o2_heatmap.png` show per-sensor normalized intensity (brighter = higher relative level for that sensor). `consolidated_impact.png` is the final fused risk surface (0–1), and `coverage_connectivity_graph.png` lets you sanity-check that the robot actually traversed the intended network. Nothing else is required: these images are the final analysis artifacts.

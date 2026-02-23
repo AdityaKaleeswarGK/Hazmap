@@ -30,7 +30,7 @@ class ProgressiveSampler:
 
     def __init__(
         self,
-        w: float = 0.15,
+        w: float = 0.30,
         delta: int = 1,
         sweep_direction: str = "x",
         obstacle_buffer: float = 0.12,
@@ -77,8 +77,8 @@ class ProgressiveSampler:
             segment_counter = 0
             if self.sweep_direction == "x":
                 grid_col = lap_grid_pos
-            if grid_col < 0 or grid_col >= map_manager.grid_width:
-                continue
+                if grid_col < 0 or grid_col >= map_manager.grid_width:
+                    continue
                 line = sampling_front[:, grid_col]
             else:
                 grid_row_fixed = lap_grid_pos
@@ -107,17 +107,6 @@ class ProgressiveSampler:
                         continue
 
                     if map_manager.is_already_covered(row, col):
-                        pos += 1
-                        continue
-
-                    if pos - last_placed < spacing_cells:
-                        pos += 1
-                        continue
-
-                    if not map_manager.is_robust_frontier_point(
-                        row, col, self.frontier_min_cells,
-                        boundary_radius_m=(self.w / 2.0),
-                    ):
                         pos += 1
                         continue
 
@@ -227,13 +216,8 @@ class ProgressiveSampler:
             if placed[r0:r1, c0:c1].any():
                 continue
 
-            if mm.is_already_covered(r, c):
-                continue
-
-            if not mm.is_robust_frontier_point(
-                r, c, self.frontier_min_cells, boundary_radius_m=(self.w / 2.0)
-            ):
-                continue
+            # Removed filters except obstacle buffer which is already handled
+            # by candidates_mask and dist_map constraint earlier.
 
             wx, wy = grid_to_world(
                 r, c, mm.origin_x, mm.origin_y, mm.resolution,
@@ -430,7 +414,7 @@ class ProgressiveSampler:
         sa = samples[best_pair[0]]
         sb = samples[best_pair[1]]
 
-        max_path_cells = int(10.0 * self.w / mm.resolution)
+        max_path_cells = int(30.0 * self.w / mm.resolution)
 
         path_cells = self._bfs_free_path(
             mm.occupancy_grid,

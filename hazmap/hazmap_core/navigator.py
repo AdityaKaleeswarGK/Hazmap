@@ -142,6 +142,10 @@ class Navigator:
         )
         t0 = time.time()
         while time.time() - t0 < duration:
+            rear_min = self._get_rear_min_distance()
+            if rear_min < 0.22:
+                self.node.get_logger().warn('Recovery: Backup blocked by rear obstacle!')
+                break
             cmd = Twist()
             cmd.linear.x = -speed
             self.cmd_pub.publish(cmd)
@@ -181,8 +185,10 @@ class Navigator:
 
         for i in range(len(scan.ranges)):
             r = scan.ranges[i]
-            if math.isinf(r) or math.isnan(r) or r < scan.range_min:
+            if math.isnan(r) or r < scan.range_min:
                 continue
+            if math.isinf(r):
+                r = scan.range_max
             angle = scan.angle_min + i * scan.angle_increment
             angle = math.atan2(math.sin(angle), math.cos(angle))
             if 0.1 < angle < 1.5:      # left side (10°–85°)
@@ -196,6 +202,26 @@ class Navigator:
         right_avg = (right_sum / right_cnt) if right_cnt > 0 else 0.0
 
         return 1.0 if left_avg >= right_avg else -1.0
+
+    def _get_rear_min_distance(self) -> float:
+        scan = self._latest_scan
+        if scan is None:
+            return float('inf')
+
+        half_arc = math.radians(60.0)  # check 120 degree cone behind
+        min_dist = float('inf')
+
+        for i in range(len(scan.ranges)):
+            r = scan.ranges[i]
+            if math.isinf(r) or math.isnan(r) or r < scan.range_min:
+                continue
+            angle = scan.angle_min + i * scan.angle_increment
+            angle = math.atan2(math.sin(angle), math.cos(angle))
+            if abs(angle) >= math.pi - half_arc:
+                if r < min_dist:
+                    min_dist = r
+
+        return min_dist
 
     @staticmethod
     def _wait_for_future(future, timeout: float, poll: float = 0.05) -> bool:
@@ -227,6 +253,7 @@ class Navigator:
 
         obstacle_block_start = None
         OBSTACLE_BLOCK_TIMEOUT = 1.5  # abort if blocked for this long
+        emergency_count = 0
 
         while time.time() - t0 < timeout:
             pose = self.pose_provider()
@@ -265,18 +292,23 @@ class Navigator:
             front_min = self._get_front_min_distance()
 
             if front_min < self.OBSTACLE_EMERGENCY_DIST:
-                self._stop_robot()
-                self.node.get_logger().warn(
-                    f'Direct nav: EMERGENCY obstacle at {front_min:.2f}m — '
-                    f'aborting immediately'
-                )
-                self._log_nav_event(
-                    x, y, 'direct', 'fail',
-                    f'emergency_obstacle_{front_min:.2f}m',
-                )
-                return False
+                emergency_count += 1
+                cmd.linear.x = 0.0  # stop forward immediately
+                if emergency_count >= 3:
+                    self._stop_robot()
+                    self.node.get_logger().warn(
+                        f'Direct nav: EMERGENCY obstacle at {front_min:.2f}m — '
+                        f'aborting immediately'
+                    )
+                    self._log_nav_event(
+                        x, y, 'direct', 'fail',
+                        f'emergency_obstacle_{front_min:.2f}m',
+                    )
+                    return False
+            else:
+                emergency_count = 0
 
-            if front_min < self.OBSTACLE_STOP_DIST:
+            if front_min < self.OBSTACLE_STOP_DIST and emergency_count < 3:
                 cmd.linear.x = 0.0   # stop forward, still allow rotation
                 if obstacle_block_start is None:
                     obstacle_block_start = time.time()

@@ -6,7 +6,7 @@ from .utils import euclidean_distance
 
 
 class WaypointSelector:
-    def __init__(self, w: float = 0.15):
+    def __init__(self, w: float = 0.30):
         self.w = w
         self._sweep_forward: bool = True
 

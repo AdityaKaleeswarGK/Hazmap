@@ -179,6 +179,11 @@ class HazMapNode(Node):
         )
 
     def _map_cb(self, msg: OccupancyGrid):
+        q = msg.info.origin.orientation
+        yaw = math.atan2(
+            2.0 * (q.w * q.z + q.x * q.y),
+            1.0 - 2.0 * (q.y * q.y + q.z * q.z),
+        )
         self.map_manager.update_map(
             data=msg.data,
             width=msg.info.width,
@@ -186,6 +191,7 @@ class HazMapNode(Node):
             resolution=msg.info.resolution,
             origin_x=msg.info.origin.position.x,
             origin_y=msg.info.origin.position.y,
+            origin_yaw=yaw,
         )
 
     def _odom_cb(self, msg: Odometry):

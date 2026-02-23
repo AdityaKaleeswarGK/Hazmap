@@ -36,7 +36,7 @@ class RCGNode:
 
 
 class RCG:
-    def __init__(self, w: float = 0.15):
+    def __init__(self, w: float = 0.30):
         self.w = w
         self.nodes: Dict[int, RCGNode] = {}
         self.next_id: int = 0
