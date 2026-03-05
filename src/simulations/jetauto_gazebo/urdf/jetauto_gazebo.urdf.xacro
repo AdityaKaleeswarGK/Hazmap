@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="utf-8"?>
+<robot name="jetauto_gazebo" xmlns:xacro="http://ros.org/wiki/xacro">
+
+  <xacro:include filename="$(find jetauto_description)/urdf/jetauto.xacro"/>
+
+  <gazebo reference="base_link">
+    <material>Gazebo/DarkGrey</material>
+  </gazebo>
+  <gazebo reference="back_shell_link">
+    <material>Gazebo/Black</material>
+  </gazebo>
+  <gazebo reference="wheel_right_front_link">
+    <material>Gazebo/Black</material>
+  </gazebo>
+  <gazebo reference="wheel_left_front_link">
+    <material>Gazebo/Black</material>
+  </gazebo>
+  <gazebo reference="wheel_right_back_link">
+    <material>Gazebo/Black</material>
+  </gazebo>
+  <gazebo reference="wheel_left_back_link">
+    <material>Gazebo/Black</material>
+  </gazebo>
+  <gazebo reference="lidar_link">
+    <material>Gazebo/Black</material>
+  </gazebo>
+  <gazebo reference="screen_link">
+    <material>Gazebo/Black</material>
+  </gazebo>
+  <gazebo reference="depth_cam_link">
+    <material>Gazebo/Black</material>
+  </gazebo>
+
+  <gazebo reference="joint1">
+    <implicitSpringDamper>true</implicitSpringDamper>
+    <springStiffness>10000</springStiffness>
+    <springReference>0</springReference>
+  </gazebo>
+
+  <gazebo reference="speaker_link">
+    <gravity>false</gravity>
+  </gazebo>
+  <gazebo reference="mic_link">
+    <gravity>false</gravity>
+  </gazebo>
+  <gazebo reference="back_shell_link">
+    <gravity>false</gravity>
+  </gazebo>
+
+  <gazebo>
+    <self_collide>false</self_collide>
+  </gazebo>
+
+  <gazebo>
+    <plugin name="planar_move_controller" filename="libgazebo_ros_planar_move.so">
+      <ros>
+        <namespace>/</namespace>
+        <remapping>cmd_vel:=cmd_vel</remapping>
+        <remapping>odom:=odom</remapping>
+      </ros>
+      <update_rate>50</update_rate>
+      <publish_rate>50</publish_rate>
+      <publish_odom>true</publish_odom>
+      <publish_odom_tf>true</publish_odom_tf>
+      <odometry_frame>odom</odometry_frame>
+      <robot_base_frame>base_footprint</robot_base_frame>
+    </plugin>
+  </gazebo>
+
+  <gazebo reference="lidar_sim_frame">
+    <sensor type="ray" name="rplidar_a1">
+      <pose>0 0 0 0 0 0</pose>
+      <visualize>true</visualize>
+      <update_rate>10</update_rate>
+      <ray>
+        <scan>
+          <horizontal>
+            <samples>180</samples>
+            <resolution>1</resolution>
+            <min_angle>-1.5708</min_angle>
+            <max_angle>1.5708</max_angle>
+          </horizontal>
+        </scan>
+        <range>
+          <min>0.15</min>
+          <max>12.0</max>
+          <resolution>0.01</resolution>
+        </range>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.01</stddev>
+        </noise>
+      </ray>
+      <plugin name="gazebo_ros_lidar" filename="libgazebo_ros_ray_sensor.so">
+        <ros>
+          <namespace>/</namespace>
+          <remapping>~/out:=scan</remapping>
+        </ros>
+        <output_type>sensor_msgs/LaserScan</output_type>
+        <frame_name>lidar_sim_frame</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="imu_link">
+    <gravity>true</gravity>
+    <sensor name="imu_sensor" type="imu">
+      <always_on>true</always_on>
+      <update_rate>100</update_rate>
+      <visualize>false</visualize>
+      <imu>
+        <angular_velocity>
+          <x><noise type="gaussian"><mean>0.0</mean><stddev>2e-4</stddev></noise></x>
+          <y><noise type="gaussian"><mean>0.0</mean><stddev>2e-4</stddev></noise></y>
+          <z><noise type="gaussian"><mean>0.0</mean><stddev>2e-4</stddev></noise></z>
+        </angular_velocity>
+        <linear_acceleration>
+          <x><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-2</stddev></noise></x>
+          <y><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-2</stddev></noise></y>
+          <z><noise type="gaussian"><mean>0.0</mean><stddev>1.7e-2</stddev></noise></z>
+        </linear_acceleration>
+      </imu>
+      <plugin name="gazebo_ros_imu" filename="libgazebo_ros_imu_sensor.so">
+        <ros>
+          <namespace>/</namespace>
+          <remapping>~/out:=imu/data</remapping>
+        </ros>
+        <initial_orientation_as_reference>false</initial_orientation_as_reference>
+        <frame_name>imu_link</frame_name>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+  <gazebo reference="depth_cam_link">
+    <sensor type="depth" name="depth_camera">
+      <update_rate>15</update_rate>
+      <camera>
+        <horizontal_fov>1.047</horizontal_fov>
+        <image>
+          <width>640</width>
+          <height>480</height>
+          <format>R8G8B8</format>
+        </image>
+        <clip>
+          <near>0.1</near>
+          <far>10.0</far>
+        </clip>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.007</stddev>
+        </noise>
+      </camera>
+      <plugin name="gazebo_ros_depth_camera" filename="libgazebo_ros_camera.so">
+        <ros>
+          <namespace>/</namespace>
+          <remapping>image_raw:=depth_camera/image_raw</remapping>
+          <remapping>image_raw/compressed:=depth_camera/image_raw/compressed</remapping>
+          <remapping>camera_info:=depth_camera/camera_info</remapping>
+          <remapping>depth/image_raw:=depth_camera/depth/image_raw</remapping>
+          <remapping>depth/camera_info:=depth_camera/depth/camera_info</remapping>
+          <remapping>points:=depth_camera/points</remapping>
+        </ros>
+        <frame_name>depth_cam_frame</frame_name>
+        <min_depth>0.1</min_depth>
+        <max_depth>10.0</max_depth>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+</robot>
