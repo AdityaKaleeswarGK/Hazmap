@@ -1,6 +1,0 @@
-int32[] box
-float64[] offset
-string label
----
-bool success
-string message

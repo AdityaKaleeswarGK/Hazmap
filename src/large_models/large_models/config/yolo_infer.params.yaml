@@ -1,7 +1,0 @@
-yolo_infer:
-  ros__parameters:
-    camera_topic: "/depth_cam/rgb/image_raw"
-    # Leave empty to use installed share/large_models/models/best.pt
-    model_path: ""
-    # Confidence threshold for detections
-    conf: 0.25
