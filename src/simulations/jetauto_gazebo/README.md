@@ -32,7 +32,7 @@ The Gazebo wrapper xacro (`urdf/jetauto_gazebo.urdf.xacro`) includes the origina
 
 Environment variables set by the launch file:
 - `MACHINE_TYPE=JetAuto`
-- `LIDAR_TYPE=A1`
+- `LIDAR_TYPE=A1 (only the front 180 degree of the lidar reading is sent to the scan topic)`
 - `DEPTH_CAMERA_TYPE=AstraProPlus`
 
 ## Commands
