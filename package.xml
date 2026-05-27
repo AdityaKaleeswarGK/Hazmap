@@ -31,10 +31,6 @@
   <exec_depend>tf2_ros</exec_depend>
   <exec_depend>tf2_geometry_msgs</exec_depend>
 
-  <!-- CV Pipeline (optional — only used when model/ has a YOLO model) -->
-  <exec_depend>cv_bridge</exec_depend>
-  <exec_depend>message_filters</exec_depend>
-
   <!-- Visualisation -->
   <exec_depend>rviz2</exec_depend>
 

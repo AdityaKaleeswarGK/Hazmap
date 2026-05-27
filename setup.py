@@ -19,6 +19,7 @@ setup(
         ('share/' + package_name + '/config', [
             'config/hazmap_params.yaml',
             'config/nav2_params.yaml',
+            'config/slam_toolbox_params.yaml',
             'config/hazmap.rviz',
         ]),
     ],

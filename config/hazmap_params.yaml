@@ -1,10 +1,12 @@
 hazmap_node:
   ros__parameters:
-    w: 0.750                # lap spacing
-    delta: 1                # sample spacing multiplier (every w*delta m)
+    w: 0.750                # lap spacing (sampling resolution)
+    rc: 0.375               # coverage radius per waypoint (≈ w/2)
+    rd: 3.0                 # detection/sampling lookahead radius
+    delta: 1                # kept for compat (unused by C* sampler)
     sweep_direction: "x"    # "x" = vertical laps, "y" = horizontal laps
-    obstacle_buffer: 0.375  
-    frontier_min_cells: 2   # robust frontier: min boundary cells in B(s,w)
+    obstacle_buffer: 0.375  # kept for compat
+    frontier_min_cells: 2   # kept for compat
     visualization_rate: 2.0  # Hz
     debug_logging: true
     use_hybrid_navigation: true
@@ -18,21 +20,11 @@ hazmap_node:
     direct_nav_fallback_to_nav2: true    # Nav2 takes over when direct hits obstacle
     direct_nav_min_clearance: 0.18      # min obstacle clearance for direct mode
 
-    # ── Environmental Sensors ───────────────────────────────────────
-    # Each sensor has a name, unit, and priority (lower = higher priority)
-    sensor_names:      ["co",  "co2", "methane", "o2"]
-    sensor_units:      ["ppm", "ppm", "ppm",     "ppm"]
-    sensor_priorities: [1,2,3,4]
-
-    # ── Visual Detection Classes ────────────────────────────────────
-    detection_class_names: [
-      "coloured_spills",       # Class 1: Distinctly coloured spills
-      "fire",                  # Class 2: Fire in shrouded environments
-      "spills_shrouded",       # Class 3: Spills in shrouded environments
-      "smoke",                 # Class 4: Smoke
-      "translucent_spills"     # Class 5: Translucent spills
-    ]
-    detection_priorities: [5, 1, 3, 2, 4]
-
     use_sim_time: true
+
+    # Early-termination threshold. Stop coverage once this fraction of the
+    # mapped free area has been visited. Lower = stops sooner with less
+    # area covered; higher = visits more nooks (slower, more revisits).
+    # 70% is a good "significant coverage" target.
+    coverage_target_percent: 70.0
 

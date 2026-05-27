@@ -17,8 +17,8 @@ import time
 class Navigator:
     """Wrapper around Nav2 NavigateToPose action + direct LiDAR-safe planner."""
 
-    OBSTACLE_EMERGENCY_DIST = 0.22   # hard stop if anything this close (m)
-    OBSTACLE_STOP_DIST      = 0.30   # abort forward motion (m)
+    OBSTACLE_EMERGENCY_DIST = 0.25   # hard stop if anything this close (m)
+    OBSTACLE_STOP_DIST      = 0.35   # abort forward motion (m)
     OBSTACLE_SLOW_DIST      = 0.50   # start decelerating (m)
     FRONT_ARC_DEG           = 35.0   # half-angle of the forward cone (°)
 
@@ -34,6 +34,8 @@ class Navigator:
         direct_yaw_tolerance: float = 0.20,
         direct_timeout: float = 20.0,
         direct_fallback_to_nav2: bool = True,
+        scan_topic: str = '/scan',
+        cmd_vel_topic: str = '/cmd_vel',
     ):
         self.node = node
         self.pose_provider = pose_provider
@@ -46,14 +48,14 @@ class Navigator:
         self.direct_timeout = direct_timeout
         self.direct_fallback_to_nav2 = direct_fallback_to_nav2
 
-        self.cmd_pub = node.create_publisher(Twist, '/cmd_vel', 10)
+        self.cmd_pub = node.create_publisher(Twist, cmd_vel_topic, 10)
         self.client = ActionClient(node, NavigateToPose, 'navigate_to_pose')
         self._goal_handle = None
 
         self._latest_scan: LaserScan = None
         cb_group = ReentrantCallbackGroup()
         self._scan_sub = node.create_subscription(
-            LaserScan, '/scan', self._scan_cb, 10,
+            LaserScan, scan_topic, self._scan_cb, 10,
             callback_group=cb_group,
         )
 
@@ -148,7 +150,8 @@ class Navigator:
                 break
             cmd = Twist()
             cmd.linear.x = -speed
-            self.cmd_pub.publish(cmd)
+            if not self._safe_publish_cmd(cmd):
+                break
             time.sleep(0.05)
         self._stop_robot()
         time.sleep(0.2)
@@ -168,7 +171,8 @@ class Navigator:
         while time.time() - t0 < rot_duration:
             cmd = Twist()
             cmd.angular.z = rot_dir * rot_speed
-            self.cmd_pub.publish(cmd)
+            if not self._safe_publish_cmd(cmd):
+                break
             time.sleep(0.05)
         self._stop_robot()
         time.sleep(0.2)
@@ -239,7 +243,18 @@ class Navigator:
 
     def _stop_robot(self):
         msg = Twist()
-        self.cmd_pub.publish(msg)
+        self._safe_publish_cmd(msg)
+
+    def _safe_publish_cmd(self, cmd: Twist) -> bool:
+        """Publish cmd_vel safely during shutdown/teardown."""
+        try:
+            self.cmd_pub.publish(cmd)
+            return True
+        except Exception as exc:
+            self.node.get_logger().warn(
+                f'Direct nav publish skipped during shutdown: {exc}'
+            )
+            return False
 
     def _go_to_direct(self, x: float, y: float, timeout: float) -> bool:
         if self.pose_provider is None:
@@ -271,10 +286,16 @@ class Navigator:
                 self._log_nav_event(x, y, 'direct', 'ok')
                 return True
 
-            it += 1
-
             target_heading = math.atan2(dy, dx)
             heading_err = self._normalize_angle(target_heading - ryaw)
+
+            # C* direct navigation overshoot check (prevent circling)
+            if dist <= 0.25 and abs(heading_err) > math.pi / 2:
+                self._stop_robot()
+                self._log_nav_event(x, y, 'direct', 'ok', 'overshoot_arrival')
+                return True
+
+            it += 1
 
             cmd = Twist()
 
@@ -345,7 +366,8 @@ class Navigator:
                     )
                     return False
 
-            self.cmd_pub.publish(cmd)
+            if not self._safe_publish_cmd(cmd):
+                return False
             time.sleep(0.05)
 
         self._stop_robot()
@@ -451,7 +473,8 @@ class Navigator:
             while time.time() - t0 < duration:
                 cmd = Twist()
                 cmd.angular.z = angular_speed
-                self.cmd_pub.publish(cmd)
+                if not self._safe_publish_cmd(cmd):
+                    break
                 time.sleep(0.05)
             self._stop_robot()
             time.sleep(0.5)  # let SLAM settle
@@ -473,7 +496,8 @@ class Navigator:
         while cumulative < target and time.time() - t0 < timeout:
             cmd = Twist()
             cmd.angular.z = angular_speed
-            self.cmd_pub.publish(cmd)
+            if not self._safe_publish_cmd(cmd):
+                break
             time.sleep(0.05)
 
             pose = self.pose_provider()

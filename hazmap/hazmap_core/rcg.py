@@ -1,739 +1,495 @@
+"""
+Rapidly Covering Graph (RCG) for the C* algorithm.
+
+The RCG is a sparse, incrementally-built graph whose nodes = potential
+waypoints and edges = potential traversal segments.  It tracks coverage
+progress via Open / Closed state on each node.
+
+Key operations (per paper):
+  • expand()  – add new nodes from frontier samples and connect edges
+  • prune()   – remove inessential nodes / edges to keep the graph sparse
+"""
+
+from __future__ import annotations
+
 import math
-import heapq
-from enum import Enum
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set
+from enum import Enum
+from typing import Dict, List, Optional, Set, Tuple
 
-from .utils import (
-    is_collision_free, world_to_grid, cells_in_radius, euclidean_distance,
-)
-from .sampling import FrontierSample
-from .map_manager import MapManager
+import numpy as np
+
+from .occupancy_grid_manager import OccupancyGridManager
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Data types
+# ──────────────────────────────────────────────────────────────────────
 class NodeState(Enum):
-    OPEN = 0      # unvisited
-    CLOSED = 1    # visited by robot
+    OPEN = "Open"
+    CLOSED = "Closed"
 
 
 @dataclass
 class RCGNode:
     """A node in the Rapidly Covering Graph."""
+
     id: int
-    x: float                     # world X
-    y: float                     # world Y
-    grid_row: int
-    grid_col: int
-    lap_index: int               # unique segment-lap id
-    base_lap_index: int          # geometric lap k (before segment split)
-    position_on_lap: int         # row index on the lap (for sorting)
+    x: float
+    y: float
+    lap_index: int  # which lap this node belongs to
+    lap_position: float  # position along the lap (0 = bottom)
     state: NodeState = NodeState.OPEN
+    is_end_node: bool = False  # end node of its lap (terminates at obstacle/boundary)
+    is_link_node: bool = False  # created by UpdateState to bridge uncovered segments
+    neighbors: Dict[str, List[int]] = field(
+        default_factory=lambda: {
+            "left": [],  # nodes on the left adjacent lap
+            "right": [],  # nodes on the right adjacent lap
+            "up": [],  # node(s) above on the same lap
+            "down": [],  # node(s) below on the same lap
+        }
+    )
 
-    neighbors: Dict[int, float] = field(default_factory=dict)
-    same_lap_prev: Optional[int] = None   # node below on same lap (lower Y)
-    same_lap_next: Optional[int] = None   # node above on same lap (higher Y)
-    cross_lap_neighbors: Set[int] = field(default_factory=set)
+    @property
+    def pos(self) -> Tuple[float, float]:
+        return (self.x, self.y)
+
+    def all_neighbor_ids(self) -> Set[int]:
+        s: Set[int] = set()
+        for lst in self.neighbors.values():
+            s.update(lst)
+        return s
 
 
+# ──────────────────────────────────────────────────────────────────────
+# RCG Graph
+# ──────────────────────────────────────────────────────────────────────
 class RCG:
-    def __init__(self, w: float = 0.30):
+    """Rapidly Covering Graph."""
+
+    def __init__(self, w: float, ogm: OccupancyGridManager):
+        """
+        Parameters
+        ----------
+        w : float   sampling resolution (distance between adjacent laps)
+        ogm :       reference to the shared OccupancyGridManager
+        """
         self.w = w
+        self.ogm = ogm
         self.nodes: Dict[int, RCGNode] = {}
-        self.next_id: int = 0
+        self.edges: Set[Tuple[int, int]] = set()
+        self._next_id = 0
+        # Indices for fast lookup
+        self._lap_nodes: Dict[
+            int, List[int]
+        ] = {}  # lap_index → [node_ids] sorted by lap_position
+        self._node_lap_index: Dict[int, int] = {}  # node_id → lap_index for O(1) lookup
+        # O(1) open/closed tracking
+        self._open_ids: Set[int] = set()
+        self._closed_ids: Set[int] = set()
 
-        self.retreat_nodes: Set[int] = set()
+    # ------------------------------------------------------------------
+    # Node management
+    # ------------------------------------------------------------------
+    def set_node_state(self, nid: int, state: NodeState) -> None:
+        """Change a node's state and update the tracking sets."""
+        node = self.nodes.get(nid)
+        if node is None:
+            return
+        if node.state == state:
+            return
+        # Remove from old set
+        if node.state == NodeState.OPEN:
+            self._open_ids.discard(nid)
+        else:
+            self._closed_ids.discard(nid)
+        # Set new state
+        node.state = state
+        # Add to new set
+        if state == NodeState.OPEN:
+            self._open_ids.add(nid)
+        else:
+            self._closed_ids.add(nid)
 
-        self.cross_lap_max_dist = 1.5 * w
-
-    def expand(
-        self, new_samples: List[FrontierSample], map_manager: MapManager
-    ) -> List[int]:
-        if not new_samples:
-            return []
-
-        new_node_ids: List[int] = []
-        new_node_set: Set[int] = set()
-
-        for sample in new_samples:
-            node = RCGNode(
-                id=self.next_id,
-                x=sample.x, y=sample.y,
-                grid_row=sample.grid_row, grid_col=sample.grid_col,
-                lap_index=sample.lap_index,
-                base_lap_index=sample.base_lap_index,
-                position_on_lap=sample.position_on_lap,
-            )
-            self.nodes[self.next_id] = node
-            new_node_ids.append(self.next_id)
-            new_node_set.add(self.next_id)
-            self.next_id += 1
-
-        self._create_same_lap_edges(map_manager, new_node_set)
-
-        self._create_cross_lap_edges(new_node_ids, map_manager)
-
-        return new_node_ids
-
-    def revalidate_edges(self, map_manager: MapManager) -> int:
-        if map_manager.occupancy_grid is None:
-            return 0
-
-        removed = 0
-        edges_to_check: set = set()
-        for nid, node in self.nodes.items():
-            for nb_id in list(node.neighbors.keys()):
-                edges_to_check.add((min(nid, nb_id), max(nid, nb_id)))
-
-        for a_id, b_id in edges_to_check:
-            na = self.nodes.get(a_id)
-            nb = self.nodes.get(b_id)
-            if na is None or nb is None:
-                continue
-            if not is_collision_free(
-                na.grid_row, na.grid_col,
-                nb.grid_row, nb.grid_col,
-                map_manager.occupancy_grid,
-            ):
-                na.neighbors.pop(b_id, None)
-                nb.neighbors.pop(a_id, None)
-                na.cross_lap_neighbors.discard(b_id)
-                nb.cross_lap_neighbors.discard(a_id)
-                if na.same_lap_next == b_id:
-                    na.same_lap_next = None
-                if nb.same_lap_prev == a_id:
-                    nb.same_lap_prev = None
-                if nb.same_lap_next == a_id:
-                    nb.same_lap_next = None
-                if na.same_lap_prev == b_id:
-                    na.same_lap_prev = None
-                removed += 1
-
-        return removed
-
-    def repair_connectivity(
+    def add_node(
         self,
-        map_manager: MapManager,
-        anchor_id: Optional[int] = None,
-        max_bridge_dist: Optional[float] = None,
-    ) -> int:
-        if len(self.nodes) < 2:
-            return 0
-        if map_manager.occupancy_grid is None:
-            return 0
+        x: float,
+        y: float,
+        lap_index: int,
+        lap_position: float,
+        is_end: bool = False,
+        is_link: bool = False,
+    ) -> RCGNode:
+        reuse_radius = max(0.05, 0.45 * self.w)
+        for nid in self._lap_nodes.get(lap_index, []):
+            existing = self.nodes.get(nid)
+            if existing is None:
+                continue
+            if math.hypot(existing.x - x, existing.y - y) <= reuse_radius:
+                existing.is_end_node = existing.is_end_node or is_end
+                existing.is_link_node = existing.is_link_node or is_link
+                return existing
 
-        if max_bridge_dist is None:
-            max_bridge_dist = self.cross_lap_max_dist
+        nid = self._next_id
+        self._next_id += 1
+        node = RCGNode(
+            id=nid,
+            x=x,
+            y=y,
+            lap_index=lap_index,
+            lap_position=lap_position,
+            is_end_node=is_end,
+            is_link_node=is_link,
+        )
+        self.nodes[nid] = node
+        self._node_lap_index[nid] = lap_index
+        # Track in open/closed sets
+        self._open_ids.add(nid)
+        self._lap_nodes.setdefault(lap_index, []).append(nid)
+        # keep lap list sorted by position via bisect
+        self._lap_nodes[lap_index].sort(key=lambda i: self.nodes[i].lap_position)
+        return node
 
-        components = self._connected_components()
-        if len(components) <= 1:
-            return 0
+    def remove_node(self, nid: int) -> None:
+        node = self.nodes.pop(nid, None)
+        if node is None:
+            return
+        # Remove from tracking
+        self._open_ids.discard(nid)
+        self._closed_ids.discard(nid)
+        self._node_lap_index.pop(nid, None)
+        # Remove all edges touching this node
+        to_remove = {e for e in self.edges if nid in e}
+        self.edges -= to_remove
+        # Remove from lap index
+        if node.lap_index in self._lap_nodes:
+            try:
+                self._lap_nodes[node.lap_index].remove(nid)
+            except ValueError:
+                pass
+        # Remove from neighbours of other nodes
+        for nb_id in node.all_neighbor_ids():
+            if nb_id in self.nodes:
+                nb = self.nodes[nb_id]
+                for direction, lst in nb.neighbors.items():
+                    if nid in lst:
+                        lst.remove(nid)
 
-        if anchor_id is None or anchor_id not in self.nodes:
-            anchor_id = next(iter(self.nodes.keys()))
+    def add_edge(self, a: int, b: int) -> None:
+        if a == b:
+            return
+        key = (min(a, b), max(a, b))
+        self.edges.add(key)
 
-        anchor_comp_idx = 0
-        for i, comp in enumerate(components):
-            if anchor_id in comp:
-                anchor_comp_idx = i
+    def has_edge(self, a: int, b: int) -> bool:
+        return (min(a, b), max(a, b)) in self.edges
+
+    def close_nearby_nodes(self, wx: float, wy: float, radius: float) -> List[int]:
+        """
+        Find all OPEN nodes within radius of (wx, wy) and mark them CLOSED.
+        Returns a list of IDs for nodes that were closed in this call.
+        """
+        closed_ids = []
+        r_sq = radius**2
+        for nid in list(self._open_ids):
+            node = self.nodes.get(nid)
+            if node is None:
+                continue
+            dist_sq = (node.x - wx) ** 2 + (node.y - wy) ** 2
+            if dist_sq <= r_sq:
+                self.set_node_state(nid, NodeState.CLOSED)
+                closed_ids.append(nid)
+        return closed_ids
+
+    # ------------------------------------------------------------------
+    # Query / Analysis
+    # ------------------------------------------------------------------
+    @property
+    def open_nodes(self) -> List[RCGNode]:
+        return [self.nodes[nid] for nid in self._open_ids if nid in self.nodes]
+
+    @property
+    def closed_nodes(self) -> List[RCGNode]:
+        return [self.nodes[nid] for nid in self._closed_ids if nid in self.nodes]
+
+    @property
+    def num_open(self) -> int:
+        return len(self._open_ids)
+
+    @property
+    def num_closed(self) -> int:
+        return len(self._closed_ids)
+
+    def nodes_on_lap(self, lap_index: int) -> List[RCGNode]:
+        return [
+            self.nodes[i] for i in self._lap_nodes.get(lap_index, []) if i in self.nodes
+        ]
+
+    def get_neighbor(self, node: RCGNode, direction: str) -> Optional[RCGNode]:
+        """Get the first (nearest) neighbour in a given direction."""
+        ids = node.neighbors.get(direction, [])
+        for nid in ids:
+            if nid in self.nodes:
+                return self.nodes[nid]
+        return None
+
+    def get_open_neighbor(self, node: RCGNode, direction: str) -> Optional[RCGNode]:
+        """Get the first Open neighbour in a given direction."""
+        ids = node.neighbors.get(direction, [])
+        for nid in ids:
+            n = self.nodes.get(nid)
+            if n and n.state == NodeState.OPEN:
+                return n
+        return None
+
+    # ------------------------------------------------------------------
+    # Expansion  (Section III-B3a of paper)
+    # ------------------------------------------------------------------
+    def expand(
+        self, frontier_samples: List[Tuple[float, float, int, float, bool]]
+    ) -> List[int]:
+        """
+        Expand the RCG with new nodes from frontier samples.
+
+        Parameters
+        ----------
+        frontier_samples : list of (x, y, lap_index, lap_position, is_end_node)
+
+        Returns
+        -------
+        new_node_ids : list of int
+        """
+        new_ids: List[int] = []
+        for x, y, lap_idx, lap_pos, is_end in frontier_samples:
+            pre_size = len(self.nodes)
+            node = self.add_node(x, y, lap_idx, lap_pos, is_end=is_end)
+
+            if len(self.nodes) == pre_size:
+                continue
+
+            new_ids.append(node.id)
+
+        for nid in new_ids:
+            self._connect_node(nid)
+
+        return new_ids
+
+    def _connect_node(self, nid: int) -> None:
+        """Connect a node to its same-lap and cross-lap neighbours."""
+        node = self.nodes[nid]
+        lap_idx = self._node_lap_index.get(nid, node.lap_index)
+        same_lap = self._lap_nodes.get(lap_idx, [])
+
+        idx_in_lap = -1
+        for i, eid in enumerate(same_lap):
+            if eid == nid:
+                idx_in_lap = i
                 break
 
-        anchor_comp = set(components[anchor_comp_idx])
-        others = [set(c) for i, c in enumerate(components) if i != anchor_comp_idx]
+        if idx_in_lap >= 0:
+            # Down neighbour
+            if idx_in_lap > 0:
+                down_id = same_lap[idx_in_lap - 1]
+                if self._can_connect(nid, down_id):
+                    self.add_edge(nid, down_id)
+                    if down_id not in node.neighbors["down"]:
+                        node.neighbors["down"].append(down_id)
+                    if nid not in self.nodes[down_id].neighbors["up"]:
+                        self.nodes[down_id].neighbors["up"].append(nid)
+            # Up neighbour
+            if idx_in_lap < len(same_lap) - 1:
+                up_id = same_lap[idx_in_lap + 1]
+                if self._can_connect(nid, up_id):
+                    self.add_edge(nid, up_id)
+                    if up_id not in node.neighbors["up"]:
+                        node.neighbors["up"].append(up_id)
+                    if nid not in self.nodes[up_id].neighbors["down"]:
+                        self.nodes[up_id].neighbors["down"].append(nid)
 
-        added = 0
-        progress = True
-        while others and progress:
-            progress = False
-            for comp in list(others):
-                bridge = self._find_best_bridge(
-                    anchor_comp, comp, map_manager, max_bridge_dist
-                )
-                if bridge is None:
+        # Cross-lap neighbours (left / right)
+        sqrt2w = math.sqrt(2) * self.w
+        for adj_lap in [node.lap_index - 1, node.lap_index + 1]:
+            direction = "left" if adj_lap < node.lap_index else "right"
+            opp_dir = "right" if direction == "left" else "left"
+            candidates = []
+            for adj_nid in self._lap_nodes.get(adj_lap, []):
+                adj_node = self.nodes.get(adj_nid)
+                if adj_node is None:
                     continue
-                a, b, dist = bridge
-                self.nodes[a].neighbors[b] = dist
-                self.nodes[b].neighbors[a] = dist
-                if abs(
-                    self.nodes[a].base_lap_index - self.nodes[b].base_lap_index
-                ) == 1:
-                    self.nodes[a].cross_lap_neighbors.add(b)
-                    self.nodes[b].cross_lap_neighbors.add(a)
-                anchor_comp.update(comp)
-                others.remove(comp)
-                added += 1
-                progress = True
+                dist = math.hypot(node.x - adj_node.x, node.y - adj_node.y)
+                if dist <= sqrt2w and self._can_connect(nid, adj_nid):
+                    lap_delta = abs(node.lap_position - adj_node.lap_position)
+                    candidates.append((lap_delta, dist, adj_nid))
 
-        return added
-
-    def _connected_components(self) -> List[Set[int]]:
-        """Return connected components of the current graph."""
-        unvisited: Set[int] = set(self.nodes.keys())
-        comps: List[Set[int]] = []
-
-        while unvisited:
-            root = next(iter(unvisited))
-            stack = [root]
-            comp: Set[int] = set()
-            unvisited.remove(root)
-
-            while stack:
-                nid = stack.pop()
-                comp.add(nid)
-                node = self.nodes.get(nid)
-                if node is None:
-                    continue
-                for adj in node.neighbors:
-                    if adj in unvisited:
-                        unvisited.remove(adj)
-                        stack.append(adj)
-
-            comps.append(comp)
-
-        return comps
-
-    def _find_best_bridge(
-        self,
-        comp_a: Set[int],
-        comp_b: Set[int],
-        mm: MapManager,
-        max_dist: float,
-    ) -> Optional[tuple]:
-        """Find shortest collision-free bridge edge between two components."""
-        best = None
-        best_d = float('inf')
-
-        for a in comp_a:
-            na = self.nodes.get(a)
-            if na is None:
+            if not candidates:
                 continue
-            for b in comp_b:
-                nb = self.nodes.get(b)
-                if nb is None:
-                    continue
-                if b in na.neighbors:
-                    continue
-                d = euclidean_distance(na.x, na.y, nb.x, nb.y)
-                if d > max_dist or d >= best_d:
-                    continue
-                if abs(na.base_lap_index - nb.base_lap_index) > 1:
-                    continue
-                if na.base_lap_index == nb.base_lap_index:
-                    continue
-                if is_collision_free(
-                    na.grid_row, na.grid_col,
-                    nb.grid_row, nb.grid_col,
-                    mm.occupancy_grid,
-                ):
-                    best = (a, b, d)
-                    best_d = d
 
-        return best
+            candidates.sort()
+            for _, _, adj_nid in candidates[:2]:
+                adj_node = self.nodes[adj_nid]
+                self.add_edge(nid, adj_nid)
+                if adj_nid not in node.neighbors[direction]:
+                    node.neighbors[direction].append(adj_nid)
+                if nid not in adj_node.neighbors[opp_dir]:
+                    adj_node.neighbors[opp_dir].append(nid)
 
-    def _create_same_lap_edges(
-        self, map_manager: MapManager, new_ids: Set[int]
-    ):
+    def _can_connect(self, a: int, b: int) -> bool:
+        """Check collision-free path between two nodes."""
+        na, nb = self.nodes[a], self.nodes[b]
+        return self.ogm.is_collision_free(na.x, na.y, nb.x, nb.y)
+
+    # ------------------------------------------------------------------
+    # Pruning  (Section III-B3b of paper)
+    # ------------------------------------------------------------------
+    def prune(self, new_node_ids: List[int]) -> None:
         """
-        Rebuild same-lap chains for every lap that has at least one new node.
+        Remove inessential nodes and edges.
+
+        A node is *essential* if:
+          1. It is adjacent to unknown area, OR
+          2. It is an end node of its lap, OR
+          3. It is in Nb(nx) where nx is an end node on an adjacent lap
+             AND either (a) n is the only cross-lap neighbour of nx on
+             n's lap, OR (b) edge (n, nx) is closer to obstacle/unknown.
+        Everything else is inessential → prune.
         """
-        affected_laps: Set[int] = set()
-        for nid in new_ids:
-            affected_laps.add(self.nodes[nid].lap_index)
-
-        laps: Dict[int, List[int]] = {}
-        for nid, node in self.nodes.items():
-            laps.setdefault(node.lap_index, []).append(nid)
-
-        for lap_index in affected_laps:
-            if lap_index not in laps:
-                continue
-            node_ids = laps[lap_index]
-            node_ids.sort(key=lambda nid: self.nodes[nid].y)
-
-            for nid in node_ids:
-                self.nodes[nid].same_lap_prev = None
-                self.nodes[nid].same_lap_next = None
-
-            for i in range(len(node_ids) - 1):
-                na = self.nodes[node_ids[i]]
-                nb = self.nodes[node_ids[i + 1]]
-
-                if node_ids[i] not in new_ids and node_ids[i + 1] not in new_ids:
-                    na.same_lap_next = nb.id
-                    nb.same_lap_prev = na.id
-                    continue
-
-                if is_collision_free(
-                    na.grid_row, na.grid_col,
-                    nb.grid_row, nb.grid_col,
-                    map_manager.occupancy_grid,
-                ):
-                    cost = euclidean_distance(na.x, na.y, nb.x, nb.y)
-                    na.neighbors[nb.id] = cost
-                    nb.neighbors[na.id] = cost
-
-                na.same_lap_next = nb.id
-                nb.same_lap_prev = na.id
-
-    def _create_cross_lap_edges(
-        self, new_node_ids: List[int], map_manager: MapManager
-    ):
-        """Connect new nodes to nodes on adjacent laps (lap ± 1) within √2·w."""
-        laps: Dict[int, List[int]] = {}
-        for nid, node in self.nodes.items():
-            laps.setdefault(node.lap_index, []).append(nid)
+        to_prune: List[int] = []
 
         for nid in new_node_ids:
-            node = self.nodes[nid]
-            for adj_lap in [node.base_lap_index - 1, node.base_lap_index + 1]:
-                for cid in self.nodes:
-                    if cid == nid:
-                        continue
-                    cand = self.nodes[cid]
-                    if cand.base_lap_index != adj_lap:
-                        continue
-                    dist = euclidean_distance(node.x, node.y, cand.x, cand.y)
-                    if dist > self.cross_lap_max_dist:
-                        continue
-                    if cid in node.neighbors:
-                        continue
-                    if is_collision_free(
-                        node.grid_row, node.grid_col,
-                        cand.grid_row, cand.grid_col,
-                        map_manager.occupancy_grid,
-                    ):
-                        node.neighbors[cid] = dist
-                        cand.neighbors[nid] = dist
-                        node.cross_lap_neighbors.add(cid)
-                        cand.cross_lap_neighbors.add(nid)
-
-    def prune(
-        self,
-        map_manager: MapManager,
-        new_node_ids: Optional[List[int]] = None,
-        protected_ids: Optional[Set[int]] = None,
-    ):
-        if protected_ids is None:
-            protected_ids = set()
-
-        if new_node_ids is not None and len(new_node_ids) > 0:
-            check_set = set(new_node_ids)
-            for nid in new_node_ids:
-                if nid in self.nodes:
-                    check_set.update(self.nodes[nid].neighbors.keys())
-        else:
-            check_set = set(self.nodes.keys())
-
-        to_remove = []
-        for nid in check_set:
-            if nid not in self.nodes:
+            node = self.nodes.get(nid)
+            if node is None:
                 continue
-            node = self.nodes[nid]
-            if node.state == NodeState.CLOSED:
+            if self._is_essential(node):
                 continue
-            if nid in self.retreat_nodes:
-                continue
-            if nid in protected_ids:
-                continue
-            if not self._is_essential_node(node, map_manager):
-                to_remove.append(nid)
+            to_prune.append(nid)
 
-        for nid in to_remove:
-            self._remove_node(nid)
+        for nid in to_prune:
+            self._prune_node(nid)
 
-        self._prune_edges(map_manager)
-
-    def _is_essential_node(self, node: RCGNode, mm: MapManager) -> bool:
-        if node.state == NodeState.CLOSED:
-            return True
-        if node.id in self.retreat_nodes:
+    def _is_essential(self, node: RCGNode) -> bool:
+        """Determine if a node is essential per Definition III.8."""
+        # Condition 1: adjacent to unknown area
+        if self.ogm.is_adjacent_to_unknown(node.x, node.y, self.w):
             return True
 
-        if mm.is_adjacent_to_unknown(node.grid_row, node.grid_col, self.w):
+        # Condition 2: end node of its lap
+        if node.is_end_node:
             return True
 
-        is_end = (node.same_lap_prev is None) or (node.same_lap_next is None)
-        if is_end:
-            return True
+        # Condition 3: connected to an end node on an adjacent lap
+        for direction in ["left", "right"]:
+            for nb_id in node.neighbors.get(direction, []):
+                nb = self.nodes.get(nb_id)
+                if nb is None or not nb.is_end_node:
+                    continue
+                # nb is an end node on adjacent lap – check if node is
+                # the only cross-lap neighbour of nb on node's lap
+                opp_dir = "right" if direction == "left" else "left"
+                nb_cross = [
+                    i
+                    for i in nb.neighbors.get(opp_dir, [])
+                    if i in self.nodes and self.nodes[i].lap_index == node.lap_index
+                ]
+                if len(nb_cross) <= 1:
+                    return True  # only neighbour → essential
 
-        for cx_nid in node.cross_lap_neighbors:
-            cx = self.nodes.get(cx_nid)
-            if cx is None:
-                continue
-            cx_is_end = (cx.same_lap_prev is None) or (cx.same_lap_next is None)
-            if not cx_is_end:
-                continue
-
-            others = [
-                n for n in cx.cross_lap_neighbors
-                if n != node.id
-                and n in self.nodes
-                and self.nodes[n].base_lap_index == node.base_lap_index
-            ]
-            if len(others) == 0:
-                return True
-
-            all_non_end = all(
-                (self.nodes[n].same_lap_prev is not None
-                 and self.nodes[n].same_lap_next is not None)
-                for n in others if n in self.nodes
-            )
-            if all_non_end:
-                if self._is_edge_closest_to_obstacle(node, cx, others, mm):
+                # Multiple neighbours – check which edge is closer to
+                # obstacles / unknown
+                my_dist = self._edge_obstacle_distance(node.id, nb_id)
+                essential = True
+                for other_id in nb_cross:
+                    if other_id == node.id:
+                        continue
+                    other_dist = self._edge_obstacle_distance(other_id, nb_id)
+                    if other_dist < my_dist:
+                        essential = False
+                        break
+                if essential:
                     return True
 
         return False  # inessential
 
-    def _is_essential_edge(self, n1: RCGNode, n2: RCGNode, mm: MapManager) -> bool:
-        if n1.lap_index == n2.lap_index:
-            return True
+    def _edge_obstacle_distance(self, a: int, b: int) -> float:
+        """
+        Average distance from the edge midpoint and k intermediate
+        points to the nearest obstacle.
+        """
+        na, nb = self.nodes[a], self.nodes[b]
+        k = 5
+        total = 0.0
+        for i in range(k + 1):
+            t = i / k
+            px = na.x + t * (nb.x - na.x)
+            py = na.y + t * (nb.y - na.y)
+            total += self.ogm.nearest_obstacle_distance(px, py, max_range=self.w * 3)
+        return total / (k + 1)
 
-        n1_end = (n1.same_lap_prev is None) or (n1.same_lap_next is None)
-        n2_end = (n2.same_lap_prev is None) or (n2.same_lap_next is None)
-
-        if n1_end and n2_end:
-            return True
-
-        if n1_end or n2_end:
-            end_n = n1 if n1_end else n2
-            other_n = n2 if n1_end else n1
-
-            others = [
-                n for n in end_n.cross_lap_neighbors
-                if n != other_n.id
-                and n in self.nodes
-                and self.nodes[n].base_lap_index == other_n.base_lap_index
-            ]
-            if len(others) == 0:
-                return True
-
-            all_non_end = all(
-                (self.nodes[n].same_lap_prev is not None
-                 and self.nodes[n].same_lap_next is not None)
-                for n in others if n in self.nodes
-            )
-            if all_non_end:
-                if self._is_edge_closest_to_obstacle(other_n, end_n, others, mm):
-                    return True
-
-        return False
-
-    def _prune_edges(self, mm: MapManager):
-        edges_to_remove = []
-        checked = set()
-        for nid, node in self.nodes.items():
-            for cx_nid in list(node.cross_lap_neighbors):
-                key = (min(nid, cx_nid), max(nid, cx_nid))
-                if key in checked:
-                    continue
-                checked.add(key)
-                cx = self.nodes.get(cx_nid)
-                if cx is None:
-                    continue
-                if not self._is_essential_edge(node, cx, mm):
-                    edges_to_remove.append((nid, cx_nid))
-
-        for a, b in edges_to_remove:
-            if a in self.nodes and b in self.nodes:
-                self.nodes[a].neighbors.pop(b, None)
-                self.nodes[b].neighbors.pop(a, None)
-                self.nodes[a].cross_lap_neighbors.discard(b)
-                self.nodes[b].cross_lap_neighbors.discard(a)
-
-    def _is_edge_closest_to_obstacle(
-        self, node, cross_node, competitors, mm
-    ) -> bool:
-        our_dist = self._edge_obstacle_dist(node, cross_node, mm)
-        for cid in competitors:
-            c = self.nodes.get(cid)
-            if c is None:
-                continue
-            if self._edge_obstacle_dist(c, cross_node, mm) < our_dist:
-                return False
-        return True
-
-    def _edge_obstacle_dist(self, n1, n2, mm, samples=5) -> float:
-        min_d = float('inf')
-        for i in range(samples + 1):
-            t = i / samples
-            px = n1.x + t * (n2.x - n1.x)
-            py = n1.y + t * (n2.y - n1.y)
-            r, c = world_to_grid(px, py, mm.origin_x, mm.origin_y, mm.resolution)
-            d = mm.distance_to_nearest_obstacle(r, c)
-            min_d = min(min_d, d)
-        return min_d
-
-    def _remove_node(self, nid: int):
-        if nid not in self.nodes:
+    def _prune_node(self, nid: int) -> None:
+        """
+        Prune an inessential node: merge its same-lap edges and
+        remove its cross-lap edges.
+        """
+        node = self.nodes.get(nid)
+        if node is None:
             return
-        node = self.nodes[nid]
 
-        prev_id = node.same_lap_prev
-        next_id = node.same_lap_next
+        # Merge same-lap edges: connect up-neighbour ↔ down-neighbour
+        up_ids = [i for i in node.neighbors.get("up", []) if i in self.nodes]
+        down_ids = [i for i in node.neighbors.get("down", []) if i in self.nodes]
+        for uid in up_ids:
+            for did in down_ids:
+                if self._can_connect(uid, did):
+                    self.add_edge(uid, did)
+                    up_n = self.nodes[uid]
+                    down_n = self.nodes[did]
+                    if did not in up_n.neighbors["down"]:
+                        up_n.neighbors["down"].append(did)
+                    if uid not in down_n.neighbors["up"]:
+                        down_n.neighbors["up"].append(uid)
 
-        if prev_id is not None and prev_id in self.nodes:
-            pn = self.nodes[prev_id]
-            pn.same_lap_next = next_id
-            pn.neighbors.pop(nid, None)
-            if next_id is not None and next_id in self.nodes:
-                nn = self.nodes[next_id]
-                cost = euclidean_distance(pn.x, pn.y, nn.x, nn.y)
-                pn.neighbors[nn.id] = cost
-                nn.neighbors[pn.id] = cost
+        self.remove_node(nid)
 
-        if next_id is not None and next_id in self.nodes:
-            nn = self.nodes[next_id]
-            nn.same_lap_prev = prev_id
-            nn.neighbors.pop(nid, None)
+    # ------------------------------------------------------------------
+    # A* shortest path on the RCG graph
+    # ------------------------------------------------------------------
+    def astar(self, start_id: int, goal_id: int) -> Optional[List[int]]:
+        """A* search on the RCG. Returns list of node ids or None."""
+        if start_id not in self.nodes or goal_id not in self.nodes:
+            return None
 
-        for adj_id in list(node.cross_lap_neighbors):
-            if adj_id in self.nodes:
-                self.nodes[adj_id].neighbors.pop(nid, None)
-                self.nodes[adj_id].cross_lap_neighbors.discard(nid)
+        goal = self.nodes[goal_id]
 
-        for adj_id in list(node.neighbors.keys()):
-            if adj_id in self.nodes:
-                self.nodes[adj_id].neighbors.pop(nid, None)
+        import heapq
 
-        self.retreat_nodes.discard(nid)
-        del self.nodes[nid]
+        open_set: list = []
+        heapq.heappush(open_set, (0.0, start_id))
+        came_from: Dict[int, int] = {}
+        g_score: Dict[int, float] = {start_id: 0.0}
 
-    def close_node(self, node_id: int):
-        """Mark CLOSED.  Update retreat nodes."""
-        if node_id not in self.nodes:
-            return
-        self.nodes[node_id].state = NodeState.CLOSED
-        self.retreat_nodes.discard(node_id)
+        while open_set:
+            _, current = heapq.heappop(open_set)
+            if current == goal_id:
+                # Reconstruct path
+                path = [current]
+                while current in came_from:
+                    current = came_from[current]
+                    path.append(current)
+                return list(reversed(path))
 
-        for adj_id in self.nodes[node_id].neighbors:
-            if adj_id in self.nodes and self.nodes[adj_id].state == NodeState.OPEN:
-                self.retreat_nodes.add(adj_id)
-
-    def update_retreat_nodes_near_robot(self, robot_x: float, robot_y: float):
-        """Add OPEN nodes within √2·w of robot to retreat_nodes."""
-        threshold = math.sqrt(2) * self.w
-        for nid, node in self.nodes.items():
-            if node.state == NodeState.OPEN:
-                if euclidean_distance(robot_x, robot_y, node.x, node.y) <= threshold:
-                    self.retreat_nodes.add(nid)
-        self.retreat_nodes = {
-            nid for nid in self.retreat_nodes
-            if nid in self.nodes and self.nodes[nid].state == NodeState.OPEN
-        }
-
-    def auto_close_covered_nodes(self, map_manager: MapManager) -> int:
-        if map_manager.covered_mask is None:
-            return 0
-        closed = 0
-        for nid, node in list(self.nodes.items()):
-            if node.state != NodeState.OPEN:
-                continue
-            if map_manager.is_already_covered(node.grid_row, node.grid_col):
-                self.close_node(nid)
-                closed += 1
-        return closed
-
-    def close_nodes_near_position(
-        self,
-        x: float,
-        y: float,
-        radius: float,
-        map_manager: Optional[MapManager] = None,
-    ) -> int:
-        closed_count = 0
-        for nid, node in list(self.nodes.items()):
-            if node.state != NodeState.OPEN:
-                continue
-            if euclidean_distance(x, y, node.x, node.y) > radius:
-                continue
-            has_closed_slp = False
-            for adj_id in (node.same_lap_prev, node.same_lap_next):
-                if adj_id is not None and adj_id in self.nodes:
-                    if self.nodes[adj_id].state == NodeState.CLOSED:
-                        has_closed_slp = True
-                        break
-            covered_here = (
-                map_manager is not None
-                and map_manager.is_already_covered(node.grid_row, node.grid_col)
-            )
-            if has_closed_slp or covered_here:
-                self.close_node(nid)
-                closed_count += 1
-        return closed_count
-
-    def find_graph_path(self, from_id: int, to_id: int) -> List[int]:
-        if from_id not in self.nodes or to_id not in self.nodes:
-            return [to_id] if to_id in self.nodes else []
-        if from_id == to_id:
-            return []
-
-        dist: Dict[int, float] = {from_id: 0.0}
-        prev: Dict[int, int] = {}
-        pq: list = [(0.0, from_id)]
-
-        while pq:
-            d, nid = heapq.heappop(pq)
-            if nid == to_id:
-                break
-            if d > dist.get(nid, float('inf')):
-                continue
-            node = self.nodes.get(nid)
+            node = self.nodes.get(current)
             if node is None:
                 continue
-            for adj_id, cost in node.neighbors.items():
-                if adj_id not in self.nodes:
+
+            for nb_id in node.all_neighbor_ids():
+                if nb_id not in self.nodes:
                     continue
-                new_d = d + cost
-                if new_d < dist.get(adj_id, float('inf')):
-                    dist[adj_id] = new_d
-                    prev[adj_id] = nid
-                    heapq.heappush(pq, (new_d, adj_id))
+                nb = self.nodes[nb_id]
+                tentative = g_score[current] + math.hypot(node.x - nb.x, node.y - nb.y)
+                if tentative < g_score.get(nb_id, float("inf")):
+                    came_from[nb_id] = current
+                    g_score[nb_id] = tentative
+                    f = tentative + math.hypot(nb.x - goal.x, nb.y - goal.y)
+                    heapq.heappush(open_set, (f, nb_id))
 
-        if to_id not in prev:
-            return [to_id]  # no graph path → direct fallback
-
-        path: List[int] = []
-        nid = to_id
-        while nid != from_id:
-            path.append(nid)
-            nid = prev.get(nid)  # type: ignore[arg-type]
-            if nid is None:
-                return [to_id]  # broken chain → direct fallback
-        path.reverse()
-        return path
-
-    def get_nearest_retreat_node(
-        self, x: float, y: float, exclude: Optional[Set[int]] = None
-    ) -> Optional[RCGNode]:
-        if not self.retreat_nodes:
-            return None
-        if exclude is None:
-            exclude = set()
-        nearest = None
-        min_dist = float('inf')
-        for nid in self.retreat_nodes:
-            if nid in exclude or nid not in self.nodes:
-                continue
-            node = self.nodes[nid]
-            if node.state != NodeState.OPEN:
-                continue
-            d = euclidean_distance(x, y, node.x, node.y)
-            if d < min_dist:
-                min_dist = d
-                nearest = node
-        return nearest
-
-    def get_best_retreat_node_by_path(
-        self, from_id: int, exclude: Optional[Set[int]] = None
-    ) -> Optional[RCGNode]:
-        if from_id not in self.nodes or not self.retreat_nodes:
-            return None
-        if exclude is None:
-            exclude = set()
-
-        dist: Dict[int, float] = {from_id: 0.0}
-        pq: list = [(0.0, from_id)]
-        visited: Set[int] = set()
-
-        while pq:
-            d, nid = heapq.heappop(pq)
-            if nid in visited:
-                continue
-            visited.add(nid)
-            node = self.nodes.get(nid)
-            if node is None:
-                continue
-            for adj_id, cost in node.neighbors.items():
-                if adj_id not in self.nodes:
-                    continue
-                nd = d + cost
-                if nd < dist.get(adj_id, float('inf')):
-                    dist[adj_id] = nd
-                    heapq.heappush(pq, (nd, adj_id))
-
-        best = None
-        best_d = float('inf')
-        for rid in self.retreat_nodes:
-            if rid in exclude or rid not in self.nodes:
-                continue
-            rn = self.nodes[rid]
-            if rn.state != NodeState.OPEN:
-                continue
-            d = dist.get(rid, float('inf'))
-            if d < best_d:
-                best = rn
-                best_d = d
-        return best
-
-    def get_nearest_open_node_by_path(
-        self, from_id: int, exclude: Optional[Set[int]] = None
-    ) -> Optional[RCGNode]:
-        if from_id not in self.nodes:
-            return None
-        if exclude is None:
-            exclude = set()
-
-        dist: Dict[int, float] = {from_id: 0.0}
-        pq: list = [(0.0, from_id)]
-        visited: Set[int] = set()
-
-        while pq:
-            d, nid = heapq.heappop(pq)
-            if nid in visited:
-                continue
-            visited.add(nid)
-            if (nid != from_id
-                    and nid not in exclude
-                    and nid in self.nodes
-                    and self.nodes[nid].state == NodeState.OPEN):
-                return self.nodes[nid]
-            node = self.nodes.get(nid)
-            if node is None:
-                continue
-            for adj_id, cost in node.neighbors.items():
-                if adj_id not in self.nodes:
-                    continue
-                nd = d + cost
-                if nd < dist.get(adj_id, float('inf')):
-                    dist[adj_id] = nd
-                    heapq.heappush(pq, (nd, adj_id))
-
-        return None   # no reachable OPEN node
-
-    def get_nearest_node(self, x: float, y: float) -> Optional[int]:
-        """Return ID of closest node to (x,y)."""
-        if not self.nodes:
-            return None
-        nearest_id = None
-        min_dist = float('inf')
-        for nid, node in self.nodes.items():
-            d = euclidean_distance(x, y, node.x, node.y)
-            if d < min_dist:
-                min_dist = d
-                nearest_id = nid
-        return nearest_id
-
-    def get_nearest_open_node(self, x: float, y: float) -> Optional[RCGNode]:
-        """Return closest OPEN node to (x,y)."""
-        nearest = None
-        min_dist = float('inf')
-        for node in self.nodes.values():
-            if node.state != NodeState.OPEN:
-                continue
-            d = euclidean_distance(x, y, node.x, node.y)
-            if d < min_dist:
-                min_dist = d
-                nearest = node
-        return nearest
-
-    def get_open_count(self) -> int:
-        return sum(1 for n in self.nodes.values() if n.state == NodeState.OPEN)
-
-    def get_closed_count(self) -> int:
-        return sum(1 for n in self.nodes.values() if n.state == NodeState.CLOSED)
-
-    def get_node_count(self) -> int:
-        return len(self.nodes)
-
-    def get_edge_count(self) -> int:
-        count = sum(len(n.neighbors) for n in self.nodes.values())
-        return count // 2
+        return None  # no path found
