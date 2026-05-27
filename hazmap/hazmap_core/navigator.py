@@ -3,10 +3,10 @@
 from rclpy.action import ActionClient
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.node import Node
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import NavigateToPose, NavigateThroughPoses
 from action_msgs.msg import GoalStatus
 from builtin_interfaces.msg import Time as RosTime
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, PoseStamped
 from sensor_msgs.msg import LaserScan
 import csv
 import math
@@ -50,6 +50,9 @@ class Navigator:
 
         self.cmd_pub = node.create_publisher(Twist, cmd_vel_topic, 10)
         self.client = ActionClient(node, NavigateToPose, 'navigate_to_pose')
+        self.ntp_client = ActionClient(
+            node, NavigateThroughPoses, 'navigate_through_poses'
+        )
         self._goal_handle = None
 
         self._latest_scan: LaserScan = None
@@ -453,6 +456,56 @@ class Navigator:
                 return False
 
         return self._go_to_nav2(x, y, yaw=yaw, timeout=timeout)
+
+    def go_through(self, poses, timeout: float = 180.0) -> bool:
+        """Drive through a sequence of (x, y) waypoints in a SINGLE Nav2
+        action. The controller follows the corridor smoothly without the
+        plan/accept/settle round-trip per waypoint, so multi-node legs are
+        much faster than calling go_to() in a loop. Returns True on success;
+        callers should fall back to per-waypoint go_to() on False."""
+        if not poses:
+            return True
+        if not self.ntp_client.server_is_ready():
+            if not self.ntp_client.wait_for_server(timeout_sec=5.0):
+                self.node.get_logger().warn(
+                    'NavigateThroughPoses server unavailable — fall back.'
+                )
+                return False
+
+        goal = NavigateThroughPoses.Goal()
+        goal.poses = []
+        for x, y in poses:
+            ps = PoseStamped()
+            ps.header.frame_id = 'map'
+            ps.header.stamp = RosTime()
+            ps.pose.position.x = float(x)
+            ps.pose.position.y = float(y)
+            ps.pose.orientation.w = 1.0
+            goal.poses.append(ps)
+
+        self.node.get_logger().info(
+            f'NavigateThroughPoses: {len(goal.poses)} waypoints in one leg'
+        )
+        send_future = self.ntp_client.send_goal_async(goal)
+        if not self._wait_for_future(send_future, timeout=10.0):
+            self.node.get_logger().warn('NTP: goal send timed out')
+            return False
+        self._goal_handle = send_future.result()
+        if not self._goal_handle.accepted:
+            self.node.get_logger().warn('NTP: goal rejected')
+            return False
+        result_future = self._goal_handle.get_result_async()
+        if not self._wait_for_future(result_future, timeout=timeout):
+            self.node.get_logger().warn(f'NTP: timed out after {timeout}s')
+            self.cancel_navigation()
+            return False
+        status = result_future.result().status
+        ok = status == GoalStatus.STATUS_SUCCEEDED
+        if ok:
+            self.node.get_logger().info('NTP: leg complete')
+        else:
+            self.node.get_logger().warn(f'NTP: failed with status {status}')
+        return ok
 
     def _feedback_cb(self, feedback_msg):
         pass  # can be used for distance-remaining logging

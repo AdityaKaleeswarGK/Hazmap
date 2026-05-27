@@ -869,7 +869,14 @@ class HazMapNode(Node):
             return
 
         self.get_logger().info(f'Spiral-STC route size: {len(waypoints)} waypoints')
-        for i, (tx, ty) in enumerate(waypoints, start=1):
+        # Fast path: drive the route in NavigateThroughPoses chunks; resume
+        # per-waypoint from the first chunk that fails.
+        resume = self._drive_route_ntp(waypoints)
+        if resume:
+            self.get_logger().info(
+                f'Spiral-STC: NTP completed {resume}/{len(waypoints)} waypoints.'
+            )
+        for i, (tx, ty) in enumerate(waypoints[resume:], start=resume + 1):
             if not self.coverage_running:
                 break
             rx, ry, _ = self._get_robot_pose()
@@ -970,7 +977,15 @@ class HazMapNode(Node):
         skipped_close_waypoints = 0
         failed_waypoints = 0
         consecutive_failures = 0
-        for i, (tx, ty) in enumerate(waypoints, start=1):
+        # Fast path: drive in NavigateThroughPoses chunks, then resume the
+        # robust per-waypoint loop from the first chunk that fails.
+        resume = self._drive_route_ntp(waypoints)
+        reached_waypoints += resume
+        if resume:
+            self.get_logger().info(
+                f'Boustrophedon: NTP completed {resume}/{len(waypoints)} waypoints.'
+            )
+        for i, (tx, ty) in enumerate(waypoints[resume:], start=resume + 1):
             if not self.coverage_running:
                 interrupted = True
                 break
@@ -1327,12 +1342,10 @@ class HazMapNode(Node):
     def _navigate_graph_path(self, from_id: int, to_id: int):
         """Navigate from from_id to to_id along the RCG.
 
-        We don't stop at every node on the A* path — those intermediates
-        are usually already-CLOSED transit nodes. Stopping at each adds
-        plan/arrive overhead and produces the "messy trajectory crossing
-        every red dot" look. Instead, drive straight to the final OPEN
-        target via Nav2; close_nearby_nodes() picks up coverage along
-        the way as the rover passes near transit nodes.
+        Preferred path: hand the whole A* corridor to Nav2 as a single
+        NavigateThroughPoses leg — the controller follows the corridor
+        smoothly without a plan/arrive round-trip per node. If that's
+        unavailable or fails, fall back to a direct goal, then hop-by-hop.
         """
         path = self.rcg.astar(from_id, to_id)
         if path is None:
@@ -1343,10 +1356,36 @@ class HazMapNode(Node):
             self.get_logger().warn(f'  Graph-path: target {to_id} missing')
             return
         target = self.rcg.nodes[to_id]
+
+        # Build the corridor waypoints from the A* nodes (drop tiny hops).
+        path_poses: list[tuple[float, float]] = []
+        last = None
+        min_step = max(0.05, 0.25 * self.w)
+        for pnid in path:
+            n = self.rcg.nodes.get(pnid)
+            if n is None:
+                continue
+            if last is not None and math.hypot(n.x - last[0], n.y - last[1]) < min_step:
+                continue
+            path_poses.append((n.x, n.y))
+            last = (n.x, n.y)
+
         self.get_logger().info(
-            f'  Graph-path {from_id}→{to_id}: '
-            f'{len(path)} hops, navigating directly to target.'
+            f'  Graph-path {from_id}→{to_id}: {len(path)} hops via '
+            f'NavigateThroughPoses ({len(path_poses)} waypoints).'
         )
+        if len(path_poses) >= 2 and self.navigator.go_through(
+            path_poses, timeout=max(60.0, 20.0 * len(path_poses))
+        ):
+            for px, py in path_poses:
+                self._mark_covered_to(px, py)
+                self.rcg.close_nearby_nodes(px, py, self.rc)
+            self.rcg.set_node_state(to_id, NodeState.CLOSED)
+            self.current_node_id = to_id
+            self._add_pose(target.x, target.y)
+            rx, ry = self._robot_x, self._robot_y
+            self.goal_selector.update_retreat_nodes(rx, ry)
+            return
 
         success = self.navigator.go_to(target.x, target.y, prefer_direct=False)
         if not success:
@@ -1383,6 +1422,27 @@ class HazMapNode(Node):
         rx, ry = self._robot_x, self._robot_y
         self.rcg.close_nearby_nodes(rx, ry, self.rc)
         self.goal_selector.update_retreat_nodes(rx, ry)
+
+    def _drive_route_ntp(self, waypoints, chunk_size: int = 25) -> int:
+        """Drive a precomputed waypoint route in NavigateThroughPoses chunks.
+
+        Returns the number of waypoints completed before the first failure (or
+        the full count). The caller resumes per-waypoint navigation from there,
+        so the robust single-goal loop stays as the fallback."""
+        completed = 0
+        n = len(waypoints)
+        while completed < n and self.coverage_running:
+            chunk = waypoints[completed:completed + chunk_size]
+            poses = [self._clamp_goal_to_map(wx, wy) for wx, wy in chunk]
+            if not self.navigator.go_through(
+                poses, timeout=max(60.0, 15.0 * len(poses))
+            ):
+                break
+            for px, py in poses:
+                self._add_pose(px, py)
+                self._mark_covered_to(px, py)
+            completed += len(chunk)
+        return completed
 
     # ------------------------------------------------------------------
     # Helpers

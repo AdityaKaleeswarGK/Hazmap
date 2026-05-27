@@ -129,50 +129,37 @@ controller_server:
       plugin: "nav2_controller::SimpleGoalChecker"
       xy_goal_tolerance: 0.20
       yaw_goal_tolerance: 0.30
-    # DWB parameters
+    # Regulated Pure Pursuit — lighter and smoother than DWB for differential
+    # waypoint following (coverage). It regulates speed on curves and near
+    # obstacles instead of sampling many trajectories every tick.
     FollowPath:
-      plugin: "dwb_core::DWBLocalPlanner"
-      debug_trajectory_details: False
-      min_vel_x: -0.20
-      min_vel_y: 0.0
-      max_vel_x: 0.22
-      max_vel_y: 0.0
-      # Critical: max_speed_theta is the hard cap. Previous 0.1 rad/s (~5.7 deg/s)
-      # made every reorientation take 15+ seconds. Match max_vel_theta.
-      max_vel_theta: 1.5
-      min_speed_xy: 0.0
-      max_speed_xy: 0.22
-      min_speed_theta: 0.0
-      max_speed_theta: 1.5
-      acc_lim_x: 2.0
-      acc_lim_y: 0.0
-      acc_lim_theta: 3.0
-      decel_lim_x: -2.0
-      decel_lim_y: 0.0
-      decel_lim_theta: -3.0
-      vx_samples: 20
-      vy_samples: 0
-      vtheta_samples: 20
-      sim_time: 1.7
-      linear_granularity: 0.05
-      angular_granularity: 0.025
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      desired_linear_vel: 0.22            # TB3 Burger top speed
+      lookahead_dist: 0.6
+      min_lookahead_dist: 0.3
+      max_lookahead_dist: 0.9
+      lookahead_time: 1.5
+      use_velocity_scaled_lookahead_dist: true
       transform_tolerance: 0.3
-      xy_goal_tolerance: 0.20
-      trans_stopped_velocity: 0.1
-      short_circuit_trajectory_evaluation: True
-      stateful: True
-      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
-      BaseObstacle.scale: 0.05
-      PathAlign.scale: 32.0
-      PathAlign.forward_point_distance: 0.1
-      GoalAlign.scale: 24.0
-      GoalAlign.forward_point_distance: 0.1
-      PathDist.scale: 32.0
-      GoalDist.scale: 24.0
-      RotateToGoal.scale: 32.0
-      # 5.0 made the final-approach rotation glacial. 1.0 = no extra slowdown.
-      RotateToGoal.slowing_factor: 1.0
-      RotateToGoal.lookahead_time: -1.0
+      use_collision_detection: true
+      max_allowed_time_to_collision_up_to_carrot: 1.0
+      # Slow down on tight curves for smoothness/stability.
+      use_regulated_linear_velocity_scaling: true
+      regulated_linear_scaling_min_radius: 0.9
+      regulated_linear_scaling_min_speed: 0.10
+      # Slow down near obstacles (proportional to cost).
+      use_cost_regulated_linear_velocity_scaling: true
+      # Rotate in place toward the path when heading error is large, instead of
+      # arcing — important on a differential base in tight coverage corridors.
+      use_rotate_to_heading: true
+      rotate_to_heading_min_angle: 0.785
+      rotate_to_heading_angular_vel: 1.5
+      max_angular_accel: 3.0
+      allow_reversing: false
+      max_robot_pose_search_dist: 10.0
+      # Final-approach behaviour.
+      min_approach_linear_velocity: 0.05
+      approach_velocity_scaling_dist: 0.6
 
 local_costmap:
   local_costmap:
