@@ -602,3 +602,104 @@ class OccupancyGridManager:
             return None
         scaled = np.clip(self._observation_quality * 100.0, 0, 100)
         return scaled.astype(np.int8)
+
+    # ------------------------------------------------------------------
+    # Frontier clustering (reach non-lap-aligned openings)
+    # ------------------------------------------------------------------
+    def _frontier_mask(self) -> Optional[np.ndarray]:
+        """Boolean grid of uncovered FREE cells adjacent to UNKNOWN space."""
+        if self._data is None:
+            return None
+        unknowns = self._data == self.UNKNOWN
+        frees = (self._data >= 0) & (self._data < self._free_threshold)
+        if self._covered_map is not None:
+            frees = frees & (~self._covered_map)
+        dil = np.zeros_like(unknowns)
+        dil[1:, :] |= unknowns[:-1, :]
+        dil[:-1, :] |= unknowns[1:, :]
+        dil[:, 1:] |= unknowns[:, :-1]
+        dil[:, :-1] |= unknowns[:, 1:]
+        return frees & dil
+
+    def find_frontier_clusters(
+        self,
+        min_cluster_cells: int = 3,
+        exclude: Optional[List[Tuple[float, float]]] = None,
+        exclude_radius: float = 0.0,
+    ) -> List[Tuple[float, float, int]]:
+        """Group frontier cells into 8-connected clusters and return one
+        navigation target per cluster (the cluster cell nearest its centroid).
+
+        Clusters are found on the raw grid, so openings that the lap-grid
+        sampler misses (narrow, oblique, between-lap) still yield a target.
+        Returns [(wx, wy, cell_count), ...]; excludes clusters whose target is
+        within exclude_radius of any blacklisted point."""
+        frontier = self._frontier_mask()
+        if frontier is None or not np.any(frontier):
+            return []
+        ys, xs = np.where(frontier)
+        cell_set = set(zip(ys.tolist(), xs.tolist()))
+        visited: set = set()
+        neighbors8 = [
+            (-1, -1), (-1, 0), (-1, 1),
+            (0, -1), (0, 1),
+            (1, -1), (1, 0), (1, 1),
+        ]
+        clusters: List[Tuple[float, float, int]] = []
+        for cell in cell_set:
+            if cell in visited:
+                continue
+            stack = [cell]
+            visited.add(cell)
+            comp: List[Tuple[int, int]] = []
+            while stack:
+                cy, cx = stack.pop()
+                comp.append((cy, cx))
+                for dy, dx in neighbors8:
+                    nb = (cy + dy, cx + dx)
+                    if nb in cell_set and nb not in visited:
+                        visited.add(nb)
+                        stack.append(nb)
+            if len(comp) < min_cluster_cells:
+                continue
+            arr = np.array(comp)
+            cy_mean = arr[:, 0].mean()
+            cx_mean = arr[:, 1].mean()
+            d2 = (arr[:, 0] - cy_mean) ** 2 + (arr[:, 1] - cx_mean) ** 2
+            best = comp[int(np.argmin(d2))]
+            row, col = best
+            wx, wy = self.grid_to_world(int(col), int(row))
+            if exclude and any(
+                math.hypot(wx - ex, wy - ey) < exclude_radius
+                for ex, ey in exclude
+            ):
+                continue
+            clusters.append((wx, wy, len(comp)))
+        return clusters
+
+    def find_nearest_frontier_cluster(
+        self,
+        wx: float,
+        wy: float,
+        min_cluster_cells: int = 3,
+        min_distance: float = 0.0,
+        max_range: float = 1e9,
+        exclude: Optional[List[Tuple[float, float]]] = None,
+        exclude_radius: float = 0.0,
+    ) -> Optional[Tuple[float, float]]:
+        """Nearest non-blacklisted frontier-cluster target to (wx, wy)."""
+        clusters = self.find_frontier_clusters(
+            min_cluster_cells=min_cluster_cells,
+            exclude=exclude,
+            exclude_radius=exclude_radius,
+        )
+        best = None
+        best_d = float('inf')
+        for cx, cy, _size in clusters:
+            d = math.hypot(cx - wx, cy - wy)
+            if d < min_distance or d > max_range:
+                continue
+            if d < best_d:
+                best_d = d
+                best = (cx, cy)
+        return best

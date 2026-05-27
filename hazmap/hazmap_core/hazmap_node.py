@@ -442,6 +442,12 @@ class HazMapNode(Node):
         # Track frontiers our safety-net has already tried and failed,
         # so we don't loop forever on an unreachable map cell.
         failed_frontiers: list[tuple[float, float]] = []
+        # Anti-revisit: a frontier that we *reach* but that yields no new
+        # area is unproductive (e.g. an opening onto space we can't actually
+        # sense into). Blacklist it and count consecutive unproductive visits
+        # so the run terminates instead of livelocking on the same cell.
+        frontier_no_gain = 0
+        FRONTIER_NO_GAIN_PATIENCE = 4
 
         # Configurable early termination: stop when coverage_target_percent
         # is reached even in unknown-map mode. Set to >100 to disable.
@@ -704,63 +710,74 @@ class HazMapNode(Node):
                             )
                         continue
 
-                # Safety net: before declaring done, ask the raw occupancy
-                # grid whether any free-cell-adjacent-to-unknown exists.
-                # Try LOCAL first (5 m) to avoid cross-room hops, then 10 m,
-                # then anywhere. This keeps trajectories close to current
-                # region until that region is genuinely exhausted.
-                if self.ogm.has_frontier_cells():
-                    target = None
-                    for search_range in (5.0, 10.0, 20.0):
-                        target = self.ogm.find_nearest_frontier(
-                            rx, ry,
-                            max_range=search_range,
-                            min_distance=max(0.0, self.direct_nav_xy_tolerance),
-                        )
-                        if target is not None:
-                            break
-                    blacklist_radius = max(self.w, 0.50)
-                    if target is not None and any(
-                        math.hypot(target[0] - fx, target[1] - fy) < blacklist_radius
-                        for fx, fy in failed_frontiers
-                    ):
-                        self.get_logger().info(
-                            f'Skipping frontier near recently-failed '
-                            f'target ({target[0]:.2f},{target[1]:.2f}).'
-                        )
-                        target = None
-                    if target is not None:
-                        tx, ty = self._clamp_goal_to_map(target[0], target[1])
-                        self.get_logger().warn(
-                            f'Sampler returned empty but map has frontiers — '
-                            f'repositioning to ({tx:.2f},{ty:.2f}) and retrying.'
-                        )
-                        self._publish_goal(tx, ty)
-                        visit_idx = self._log_visit(
-                            'safety_net', tx, ty,
-                        )
-                        success = self.navigator.go_to(
-                            tx, ty, prefer_direct=False, timeout=60.0,
-                        )
-                        self._mark_visit_result(
-                            visit_idx, 'arrived' if success else 'nav_failed',
-                        )
-                        if success:
-                            self._add_pose(tx, ty)
-                            self._mark_covered_to(tx, ty)
-                            continue
+                # Safety net: before declaring done, look for unexplored
+                # openings via frontier *clusters* (free-cell groups adjacent
+                # to unknown). Clusters find non-lap-aligned openings the lap
+                # sampler misses; excluding blacklisted frontiers makes the
+                # rover sweep every reachable opening exactly once instead of
+                # livelocking on the nearest unproductive cell.
+                blacklist_radius = max(self.w, 0.50)
+                target = self.ogm.find_nearest_frontier_cluster(
+                    rx, ry,
+                    min_cluster_cells=3,
+                    min_distance=max(0.0, self.direct_nav_xy_tolerance),
+                    exclude=failed_frontiers,
+                    exclude_radius=blacklist_radius,
+                )
+                if target is not None:
+                    tx, ty = self._clamp_goal_to_map(target[0], target[1])
+                    self.get_logger().warn(
+                        f'No lap samples left — repositioning to frontier '
+                        f'opening ({tx:.2f},{ty:.2f}).'
+                    )
+                    pre_pct, pre_area, pre_free = self._coverage_stats()
+                    self._publish_goal(tx, ty)
+                    visit_idx = self._log_visit('safety_net', tx, ty)
+                    success = self.navigator.go_to(
+                        tx, ty, prefer_direct=False, timeout=60.0,
+                    )
+                    self._mark_visit_result(
+                        visit_idx, 'arrived' if success else 'nav_failed',
+                    )
+                    if not success:
+                        # Unreachable opening — blacklist and move on.
                         failed_frontiers.append((tx, ty))
-                        if len(failed_frontiers) >= 3:
-                            self.get_logger().warn(
-                                'Too many frontier-reposition failures '
-                                '— declaring complete.'
-                            )
+                        frontier_no_gain += 1
+                        self.get_logger().warn(
+                            f'Frontier nav failed; blacklisting '
+                            f'({tx:.2f},{ty:.2f}) (no_gain={frontier_no_gain}).'
+                        )
+                    else:
+                        self._add_pose(tx, ty)
+                        self._mark_covered_to(tx, ty)
+                        rx, ry = self._robot_x, self._robot_y
+                        # Let SLAM/coverage settle, then check whether this
+                        # opening actually revealed or covered anything.
+                        post_pct, post_area, post_free = self._coverage_stats()
+                        gained = (
+                            (post_area - pre_area) >= MIN_AREA_GROWTH_M2
+                            or (post_free - pre_free) >= MIN_FREE_GROWTH_M2
+                        )
+                        if gained:
+                            frontier_no_gain = 0
                         else:
+                            # Reached, but no new area — this opening is a
+                            # dead-end for sensing. Blacklist so we never
+                            # return here (this is the old livelock cause).
+                            failed_frontiers.append((tx, ty))
+                            frontier_no_gain += 1
                             self.get_logger().warn(
-                                'Frontier-reposition nav failed; will try '
-                                'a different frontier on next outer iter.'
+                                f'Frontier ({tx:.2f},{ty:.2f}) reached but '
+                                f'added no area — blacklisting '
+                                f'(no_gain={frontier_no_gain}).'
                             )
-                            continue
+                    if frontier_no_gain < FRONTIER_NO_GAIN_PATIENCE:
+                        continue
+                    self.get_logger().warn(
+                        f'No productive frontier in '
+                        f'{FRONTIER_NO_GAIN_PATIENCE} attempts — '
+                        f'remaining unknown is unreachable. Completing.'
+                    )
 
                 self.get_logger().info(
                     '╔══════════════════════════════════╗\n'
@@ -1211,27 +1228,18 @@ class HazMapNode(Node):
     def _nbv_push_to_frontier(
         self, rx: float, ry: float, failed_frontiers: list
     ) -> bool:
-        """Reposition toward the nearest raw-grid frontier (free-adjacent-to-
-        unknown) so unknown area keeps getting revealed. Returns True if a
-        reposition was attempted successfully."""
-        if not self.ogm.has_frontier_cells():
-            return False
-        target = None
-        for search_range in (5.0, 10.0, 20.0):
-            target = self.ogm.find_nearest_frontier(
-                rx, ry,
-                max_range=search_range,
-                min_distance=max(0.0, self.direct_nav_xy_tolerance),
-            )
-            if target is not None:
-                break
-        if target is None:
-            return False
+        """Reposition toward the nearest unexplored opening (frontier
+        cluster), skipping blacklisted ones, so unknown area keeps getting
+        revealed. Returns True if a reposition was attempted successfully."""
         blacklist_radius = max(self.w, 0.50)
-        if any(
-            math.hypot(target[0] - fx, target[1] - fy) < blacklist_radius
-            for fx, fy in failed_frontiers
-        ):
+        target = self.ogm.find_nearest_frontier_cluster(
+            rx, ry,
+            min_cluster_cells=3,
+            min_distance=max(0.0, self.direct_nav_xy_tolerance),
+            exclude=failed_frontiers,
+            exclude_radius=blacklist_radius,
+        )
+        if target is None:
             return False
         tx, ty = self._clamp_goal_to_map(target[0], target[1])
         self.get_logger().info(
@@ -1242,12 +1250,15 @@ class HazMapNode(Node):
         self._mark_visit_result(
             visit_idx, 'arrived' if success else 'nav_failed',
         )
+        # Blacklist this opening either way: if reached, the next observation
+        # reveals it and new frontiers appear elsewhere; if it stays a frontier
+        # we must not re-pick the same spot (prevents livelock).
+        failed_frontiers.append((tx, ty))
         if success:
             self._add_pose(tx, ty)
             self._mark_covered_to(tx, ty)
             self.current_node_id = self._nearest_node_id(tx, ty)
             return True
-        failed_frontiers.append((tx, ty))
         return False
 
     def _publish_observation_grid(self):
