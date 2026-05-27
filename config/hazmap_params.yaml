@@ -28,3 +28,18 @@ hazmap_node:
     # 70% is a good "significant coverage" target.
     coverage_target_percent: 70.0
 
+    # ── Next-Best-View mode (set coverage_mode: "nbv") ──────────────────
+    # Surveillance / gas-mapping style coverage: the rover drives to the
+    # viewpoint that *reveals* the most still-unseen area, crediting cells
+    # by graded line-of-sight observation rather than by driving over them.
+    coverage_mode: "cstar"        # "cstar" | "nbv" | "boustrophedon_known" | "spiral_stc_known"
+    sensor_range: 0.0             # observation range (m); 0 → use rd
+    sensor_fov_deg: 360.0         # 360 = LiDAR; narrower models a camera
+    nbv_n_rays: 72                # rays per viewpoint (raycast resolution)
+    nbv_q_min: 0.4                # quality (0..1) at which a cell counts "observed"
+    nbv_target_percent: 90.0      # stop once this much free space is observed
+    nbv_cost_weight: 1.0          # travel-cost exponent in gain/cost^alpha
+    nbv_max_candidates: 40        # OPEN nodes evaluated per step (perf cap)
+    nbv_min_gain: 1.0             # min quality-units a view must add to bother
+    nbv_no_gain_patience: 8       # stop after this many no-gain/blocked steps
+

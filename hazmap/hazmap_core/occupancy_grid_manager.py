@@ -33,6 +33,14 @@ class OccupancyGridManager:
         self._all_painted_centers: List[Tuple[float, float, float]] = []
         self._pending_paints: List[Tuple[float, float, float]] = []
 
+        # ── Next-Best-View observation model ──────────────────────────────
+        # Per-cell best sensing quality (0..1) with which each cell has been
+        # *seen* (line-of-sight, within sensor range). Distinct from
+        # _covered_map (cells driven over). Rebuilt from the recorded
+        # viewpoint history on map resize/origin shift, like _covered_map.
+        self._observation_quality: Optional[np.ndarray] = None
+        self._observation_views: List[Tuple[float, float, float, float, int]] = []
+
     # ------------------------------------------------------------------
     # Update from ROS message
     # ------------------------------------------------------------------
@@ -76,6 +84,7 @@ class OccupancyGridManager:
             # Re-paint covered cells in the new grid frame from stored
             # world-coord centers, so coverage stats survive map jumps.
             self._rebuild_covered_map()
+            self._rebuild_observation_quality()
         else:
             for wx, wy, r in self._pending_paints:
                 self._paint_circle_on_map(wx, wy, r)
@@ -439,3 +448,157 @@ class OccupancyGridManager:
         total_m2 = total_free_cells * (self._resolution**2)
 
         return percent, area_m2, total_m2
+
+    # ------------------------------------------------------------------
+    # Next-Best-View observation model
+    # ------------------------------------------------------------------
+    def _rebuild_observation_quality(self) -> None:
+        """Allocate a fresh quality grid and replay the viewpoint history."""
+        if self._data is None:
+            self._observation_quality = None
+            return
+        self._observation_quality = np.zeros(
+            (self._height, self._width), dtype=np.float32
+        )
+        for vx, vy, vr, vfov, vrays in self._observation_views:
+            self._cast_observation(vx, vy, vr, vfov, vrays, commit=True)
+
+    def observe_from(
+        self,
+        wx: float,
+        wy: float,
+        sensor_range: float,
+        fov_deg: float = 360.0,
+        n_rays: int = 72,
+        yaw: float = 0.0,
+        record: bool = True,
+    ) -> None:
+        """Raycast from a viewpoint and raise the observation quality of every
+        unoccluded free cell it sees. Quality decays linearly with distance."""
+        if record:
+            self._observation_views.append(
+                (wx, wy, sensor_range, fov_deg, n_rays)
+            )
+        if self._data is None:
+            return  # map not ready yet; replayed on first update()
+        if (
+            self._observation_quality is None
+            or self._observation_quality.shape != (self._height, self._width)
+        ):
+            # (Re)allocate and replay history (current view already recorded).
+            self._rebuild_observation_quality()
+            return
+        self._cast_observation(wx, wy, sensor_range, fov_deg, n_rays,
+                               commit=True, yaw=yaw)
+
+    def predict_observation_gain(
+        self,
+        wx: float,
+        wy: float,
+        sensor_range: float,
+        fov_deg: float = 360.0,
+        n_rays: int = 72,
+        yaw: float = 0.0,
+    ) -> float:
+        """Quality-weighted info gain a viewpoint would add WITHOUT committing:
+        sum over visible free cells of max(0, q_new - q_current)."""
+        if self._data is None:
+            return 0.0
+        return self._cast_observation(wx, wy, sensor_range, fov_deg, n_rays,
+                                      commit=False, yaw=yaw)
+
+    def _cast_observation(
+        self,
+        wx: float,
+        wy: float,
+        sensor_range: float,
+        fov_deg: float,
+        n_rays: int,
+        commit: bool,
+        yaw: float = 0.0,
+    ) -> float:
+        """Shared raycast core. If commit, writes max-quality into the grid and
+        returns 0. If not commit, returns the predicted added quality (gain)."""
+        if self._data is None:
+            return 0.0
+        gx0, gy0 = self.world_to_grid(wx, wy)
+        if not self._in_bounds(gx0, gy0):
+            return 0.0
+        range_cells = max(1, int(sensor_range / self._resolution))
+        n_rays = max(1, int(n_rays))
+        full_circle = fov_deg >= 359.0
+        fov = math.radians(fov_deg)
+
+        # Dedup cells across rays within this single viewpoint (keep best q).
+        seen: dict = {} if not commit else None
+
+        for i in range(n_rays):
+            if full_circle:
+                ang = yaw + 2.0 * math.pi * (i / n_rays)
+            elif n_rays > 1:
+                ang = yaw - fov / 2.0 + fov * (i / (n_rays - 1))
+            else:
+                ang = yaw
+            ex = gx0 + int(round(range_cells * math.cos(ang)))
+            ey = gy0 + int(round(range_cells * math.sin(ang)))
+            for gx, gy in self._bresenham(gx0, gy0, ex, ey):
+                if gx == gx0 and gy == gy0:
+                    continue
+                if not self._in_bounds(gx, gy):
+                    break
+                d = math.hypot(gx - gx0, gy - gy0) * self._resolution
+                if d > sensor_range:
+                    break
+                v = int(self._data[gy, gx])
+                if v == self.UNKNOWN:
+                    break  # cannot see past unknown space
+                if v >= self._free_threshold:
+                    break  # occluded by obstacle
+                q = 1.0 - d / sensor_range
+                if q <= 0.0:
+                    continue
+                if commit:
+                    if q > self._observation_quality[gy, gx]:
+                        self._observation_quality[gy, gx] = q
+                else:
+                    prev = seen.get((gy, gx))
+                    if prev is None or q > prev:
+                        seen[(gy, gx)] = q
+
+        if commit:
+            return 0.0
+        gain = 0.0
+        for (gy, gx), q in seen.items():
+            cur = (
+                float(self._observation_quality[gy, gx])
+                if self._observation_quality is not None
+                else 0.0
+            )
+            if q > cur:
+                gain += q - cur
+        return gain
+
+    def get_observation_statistics(
+        self, q_min: float
+    ) -> Tuple[float, float, float]:
+        """Observation coverage: (percent, observed_m2, total_free_m2), where a
+        free cell counts as observed once its quality reaches q_min."""
+        if self._data is None or self._observation_quality is None:
+            return 0.0, 0.0, 0.0
+        frees = (self._data >= 0) & (self._data < self._free_threshold)
+        total_free_cells = np.sum(frees)
+        if total_free_cells == 0:
+            return 0.0, 0.0, 0.0
+        observed = frees & (self._observation_quality >= q_min)
+        observed_cells = np.sum(observed)
+        percent = (observed_cells / total_free_cells) * 100.0
+        area_m2 = observed_cells * (self._resolution**2)
+        total_m2 = total_free_cells * (self._resolution**2)
+        return percent, area_m2, total_m2
+
+    def observation_quality_grid_int8(self) -> Optional[np.ndarray]:
+        """Quality grid scaled to 0..100 int8 for OccupancyGrid visualization."""
+        if self._observation_quality is None:
+            return None
+        scaled = np.clip(self._observation_quality * 100.0, 0, 100)
+        return scaled.astype(np.int8)

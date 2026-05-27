@@ -22,6 +22,7 @@ from .tsp_solver import TSPSolver, TSPPlan
 from .navigator import Navigator
 from .spiral_stc import SpiralSTCPlanner
 from .boustrophedon import BoustrophedonPlanner
+from .next_best_view import NextBestViewSelector
 
 
 class HazMapNode(Node):
@@ -72,6 +73,16 @@ class HazMapNode(Node):
         self.declare_parameter('coverage_refine_search_range', 100.0)
         self.declare_parameter('coverage_refine_no_gain_patience', 10)
         self.declare_parameter('coverage_refine_min_gain_percent', 0.20)
+        # ── Next-Best-View (coverage_mode: 'nbv') ────────────────────────
+        self.declare_parameter('sensor_range', 0.0)          # 0 → fall back to rd
+        self.declare_parameter('sensor_fov_deg', 360.0)
+        self.declare_parameter('nbv_n_rays', 72)
+        self.declare_parameter('nbv_q_min', 0.4)             # quality → "observed"
+        self.declare_parameter('nbv_target_percent', 90.0)   # observed-coverage goal
+        self.declare_parameter('nbv_cost_weight', 1.0)       # travel-cost exponent
+        self.declare_parameter('nbv_max_candidates', 40)
+        self.declare_parameter('nbv_min_gain', 1.0)          # quality units to bother
+        self.declare_parameter('nbv_no_gain_patience', 8)
 
         self.w = self.get_parameter('w').value
         self.rc = self.get_parameter('rc').value
@@ -130,6 +141,16 @@ class HazMapNode(Node):
         self.coverage_refine_min_gain_percent = self.get_parameter(
             'coverage_refine_min_gain_percent'
         ).value
+        _sensor_range = self.get_parameter('sensor_range').value
+        self.sensor_range = _sensor_range if _sensor_range > 0.0 else self.rd
+        self.sensor_fov_deg = self.get_parameter('sensor_fov_deg').value
+        self.nbv_n_rays = self.get_parameter('nbv_n_rays').value
+        self.nbv_q_min = self.get_parameter('nbv_q_min').value
+        self.nbv_target_percent = self.get_parameter('nbv_target_percent').value
+        self.nbv_cost_weight = self.get_parameter('nbv_cost_weight').value
+        self.nbv_max_candidates = self.get_parameter('nbv_max_candidates').value
+        self.nbv_min_gain = self.get_parameter('nbv_min_gain').value
+        self.nbv_no_gain_patience = self.get_parameter('nbv_no_gain_patience').value
 
         # ── C* core algorithm objects ────────────────────────────────
         self.ogm = OccupancyGridManager(free_threshold=50)
@@ -155,6 +176,16 @@ class HazMapNode(Node):
             self.ogm,
             lap_spacing_m=self.lawnmower_spacing,
             boundary_margin_m=self.lawnmower_boundary_margin,
+        )
+        self.nbv_selector = NextBestViewSelector(
+            self.rcg,
+            self.ogm,
+            sensor_range=self.sensor_range,
+            fov_deg=self.sensor_fov_deg,
+            n_rays=int(self.nbv_n_rays),
+            q_min=self.nbv_q_min,
+            cost_weight=self.nbv_cost_weight,
+            max_candidates=int(self.nbv_max_candidates),
         )
         self.navigator = None  # initialised in run_coverage
         self._coverage_anchor = None
@@ -197,6 +228,9 @@ class HazMapNode(Node):
         self.laps_pub = self.create_publisher(MarkerArray, 'hazmap/laps', 10)
         self.frontier_pub = self.create_publisher(
             MarkerArray, 'hazmap/frontier_points', 10
+        )
+        self.obs_quality_pub = self.create_publisher(
+            OccupancyGrid, 'hazmap/observation_quality', map_qos
         )
 
         self.create_service(
@@ -324,6 +358,9 @@ class HazMapNode(Node):
             return
         if self.coverage_mode == 'spiral_stc_known':
             self.run_coverage_spiral_stc()
+            return
+        if self.coverage_mode == 'nbv':
+            self.run_coverage_nbv()
             return
 
         """HazMap coverage algorithm using C* core — runs in a dedicated thread."""
@@ -1006,6 +1043,230 @@ class HazMapNode(Node):
                     f'target={float(self.coverage_target_percent):.1f}%.'
                 )
         self._save_visit_log()
+
+    # ------------------------------------------------------------------
+    # Next-Best-View coverage (coverage_mode: 'nbv')
+    # ------------------------------------------------------------------
+    def run_coverage_nbv(self):
+        """Information-gain coverage: repeatedly drive to the OPEN viewpoint
+        that reveals the most still-unseen area, until a high observed-coverage
+        target is met. Credits cells by graded line-of-sight observation
+        (sensor_range) rather than by driving over them."""
+        self.coverage_running = True
+        self.coverage_complete = False
+        self.get_logger().info('═══ HAZMAP COVERAGE STARTING (Next-Best-View) ═══')
+
+        self.get_logger().info('Waiting for /map …')
+        t0 = time.time()
+        while not self.ogm.ready:
+            if time.time() - t0 > 30.0:
+                self.get_logger().error('Timeout waiting for /map!')
+                self.coverage_running = False
+                return
+            time.sleep(0.5)
+
+        self.get_logger().info('Map received — waiting for stabilisation …')
+        time.sleep(3.0)
+
+        self.navigator = Navigator(
+            self,
+            pose_provider=self._get_robot_pose,
+            safety_check=self._direct_safety_check,
+            direct_enabled=self.use_hybrid_navigation,
+            direct_linear_speed=self.direct_nav_linear_speed,
+            direct_angular_speed=self.direct_nav_angular_speed,
+            direct_xy_tolerance=self.direct_nav_xy_tolerance,
+            direct_yaw_tolerance=self.direct_nav_yaw_tolerance,
+            direct_timeout=self.direct_nav_timeout,
+            direct_fallback_to_nav2=self.direct_nav_fallback_to_nav2,
+            scan_topic=self.scan_topic,
+            cmd_vel_topic=self.cmd_vel_topic,
+        )
+        if not self.navigator.is_server_ready():
+            self.get_logger().error('Nav2 action server not ready!')
+            self.coverage_running = False
+            return
+
+        rx, ry, ryaw = self._get_robot_pose()
+        self.get_logger().info(
+            f'NBV start: ({rx:.2f}, {ry:.2f}), sensor_range={self.sensor_range:.2f}m, '
+            f'fov={self.sensor_fov_deg:.0f}°, q_min={self.nbv_q_min:.2f}, '
+            f'target={self.nbv_target_percent:.1f}%'
+        )
+        self._reset_coverage_anchor(rx, ry)
+        self.nbv_selector.record_observation(rx, ry, ryaw)
+
+        new_samples = self.sampler.generate_samples(rx, ry)
+        self.frontier_samples = list(new_samples)
+        if new_samples:
+            new_ids = self.rcg.expand(new_samples)
+            self.rcg.prune(new_ids)
+        self.current_node_id = self._nearest_node_id(rx, ry)
+        self.initialized = True
+
+        target = float(self.nbv_target_percent)
+        no_gain = 0
+        failed_frontiers: list[tuple[float, float]] = []
+        step = 0
+
+        while self.coverage_running:
+            step += 1
+            rx, ry, ryaw = self._get_robot_pose()
+
+            # See from here, then check coverage.
+            self.nbv_selector.record_observation(rx, ry, ryaw)
+            self._publish_observation_grid()
+            pct, obs_area, total_free = self.ogm.get_observation_statistics(
+                self.nbv_q_min
+            )
+            self.get_logger().info(
+                f'  Step {step}: observed={pct:.1f}% '
+                f'({obs_area:.1f}/{total_free:.1f} m²), '
+                f'OPEN={self.rcg.num_open}, no_gain={no_gain}'
+            )
+            if pct >= target:
+                self.get_logger().info(
+                    f'╔══════════════════════════════════╗\n'
+                    f'║   OBSERVED-COVERAGE TARGET MET   ║\n'
+                    f'║   {pct:.1f}% ≥ {target:.1f}% — stopping.\n'
+                    f'╚══════════════════════════════════╝'
+                )
+                self.coverage_complete = True
+                break
+
+            # Grow candidate viewpoints into newly-revealed / unknown area.
+            new_samples = self.sampler.generate_samples(rx, ry)
+            if new_samples:
+                self.frontier_samples = list(new_samples)
+                new_ids = self.rcg.expand(new_samples)
+                self.rcg.prune(new_ids)
+
+            next_id, gain = self.nbv_selector.select_view(
+                self.current_node_id, rx, ry
+            )
+
+            if next_id is None or gain < self.nbv_min_gain:
+                # No worthwhile viewpoint — push into unknown via raw frontier,
+                # so an unknown place keeps getting explored.
+                if self._nbv_push_to_frontier(rx, ry, failed_frontiers):
+                    no_gain = 0
+                    continue
+                no_gain += 1
+                if no_gain >= int(self.nbv_no_gain_patience):
+                    self.get_logger().info(
+                        f'NBV: no information gain for {no_gain} steps and no '
+                        f'reachable frontier — stopping at {pct:.1f}%.'
+                    )
+                    self.coverage_complete = pct >= target
+                    break
+                time.sleep(0.1)
+                continue
+
+            target_node = self.rcg.nodes[next_id]
+            self.get_logger().info(
+                f'  → view {next_id} ({target_node.x:.2f},{target_node.y:.2f}) '
+                f'gain={gain:.1f}'
+            )
+            self._publish_goal(target_node.x, target_node.y)
+            visit_idx = self._log_visit(
+                'nbv', target_node.x, target_node.y, node_id=next_id,
+            )
+            success = self.navigator.go_to(
+                target_node.x, target_node.y, prefer_direct=False
+            )
+            self._mark_visit_result(
+                visit_idx, 'arrived' if success else 'nav_failed',
+            )
+
+            if not success:
+                # Unreachable viewpoint — close it so we stop choosing it.
+                if next_id in self.rcg.nodes:
+                    self.rcg.set_node_state(next_id, NodeState.CLOSED)
+                self.navigator.backup(distance=0.30, speed=0.10, rotate_angle=0.5)
+                no_gain += 1
+                if no_gain >= int(self.nbv_no_gain_patience):
+                    self.get_logger().warn(
+                        'NBV: too many unreachable viewpoints — stopping.'
+                    )
+                    break
+                continue
+
+            no_gain = 0
+            self.current_node_id = next_id
+            self._add_pose(target_node.x, target_node.y)
+            self._mark_covered_to(target_node.x, target_node.y)
+            rx, ry, ryaw = self._get_robot_pose()
+            self.rcg.close_nearby_nodes(rx, ry, self.rc)
+            time.sleep(0.05)
+
+        self._publish_observation_grid()
+        final_pct, _, _ = self.ogm.get_observation_statistics(self.nbv_q_min)
+        self.get_logger().info(
+            f'HazMap NBV finished. Observed coverage {final_pct:.1f}% '
+            f'in {step} steps.'
+        )
+        self._save_visit_log()
+        self.coverage_running = False
+
+    def _nbv_push_to_frontier(
+        self, rx: float, ry: float, failed_frontiers: list
+    ) -> bool:
+        """Reposition toward the nearest raw-grid frontier (free-adjacent-to-
+        unknown) so unknown area keeps getting revealed. Returns True if a
+        reposition was attempted successfully."""
+        if not self.ogm.has_frontier_cells():
+            return False
+        target = None
+        for search_range in (5.0, 10.0, 20.0):
+            target = self.ogm.find_nearest_frontier(
+                rx, ry,
+                max_range=search_range,
+                min_distance=max(0.0, self.direct_nav_xy_tolerance),
+            )
+            if target is not None:
+                break
+        if target is None:
+            return False
+        blacklist_radius = max(self.w, 0.50)
+        if any(
+            math.hypot(target[0] - fx, target[1] - fy) < blacklist_radius
+            for fx, fy in failed_frontiers
+        ):
+            return False
+        tx, ty = self._clamp_goal_to_map(target[0], target[1])
+        self.get_logger().info(
+            f'  NBV: no graph gain — pushing to frontier ({tx:.2f},{ty:.2f}).'
+        )
+        visit_idx = self._log_visit('nbv_frontier', tx, ty)
+        success = self.navigator.go_to(tx, ty, prefer_direct=False, timeout=60.0)
+        self._mark_visit_result(
+            visit_idx, 'arrived' if success else 'nav_failed',
+        )
+        if success:
+            self._add_pose(tx, ty)
+            self._mark_covered_to(tx, ty)
+            self.current_node_id = self._nearest_node_id(tx, ty)
+            return True
+        failed_frontiers.append((tx, ty))
+        return False
+
+    def _publish_observation_grid(self):
+        """Publish the NBV observation-quality field as an OccupancyGrid
+        (0..100 = sensing quality) for RViz inspection."""
+        grid = self.ogm.observation_quality_grid_int8()
+        if grid is None:
+            return
+        msg = OccupancyGrid()
+        msg.header.frame_id = 'map'
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.info.resolution = self.ogm._resolution
+        msg.info.width = self.ogm._width
+        msg.info.height = self.ogm._height
+        msg.info.origin.position.x = self.ogm._origin_x
+        msg.info.origin.position.y = self.ogm._origin_y
+        msg.info.origin.orientation.w = 1.0
+        msg.data = grid.flatten().tolist()
+        self.obs_quality_pub.publish(msg)
 
     # ------------------------------------------------------------------
     # Coverage hole detection (uses C* TSPSolver)
