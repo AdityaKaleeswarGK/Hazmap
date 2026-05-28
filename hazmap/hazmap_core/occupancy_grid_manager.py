@@ -603,6 +603,30 @@ class OccupancyGridManager:
         scaled = np.clip(self._observation_quality * 100.0, 0, 100)
         return scaled.astype(np.int8)
 
+    def predict_coverage_gain(self, wx: float, wy: float, radius: float) -> int:
+        """Number of FREE cells within radius of (wx, wy) that are NOT yet
+        marked covered. Used by the utility-based goal selector to choose the
+        candidate that adds the most *new* swath, killing lap-priority bias
+        and redundant traversal of already-covered area."""
+        if self._data is None:
+            return 0
+        gx0, gy0 = self.world_to_grid(wx, wy)
+        r_cells = max(1, int(radius / self._resolution))
+        x_min = max(0, gx0 - r_cells)
+        x_max = min(self._width, gx0 + r_cells + 1)
+        y_min = max(0, gy0 - r_cells)
+        y_max = min(self._height, gy0 + r_cells + 1)
+        if x_min >= x_max or y_min >= y_max:
+            return 0
+        sub = self._data[y_min:y_max, x_min:x_max]
+        free_mask = (sub >= 0) & (sub < self._free_threshold)
+        if self._covered_map is not None:
+            free_mask &= ~self._covered_map[y_min:y_max, x_min:x_max]
+        dy = np.arange(y_min, y_max) - gy0
+        dx = np.arange(x_min, x_max) - gx0
+        disk = (dy[:, None] ** 2 + dx[None, :] ** 2) <= r_cells * r_cells
+        return int(np.sum(free_mask & disk))
+
     # ------------------------------------------------------------------
     # Frontier clustering (reach non-lap-aligned openings)
     # ------------------------------------------------------------------

@@ -25,8 +25,10 @@ hazmap_node:
     # Early-termination threshold. Stop coverage once this fraction of the
     # mapped free area has been visited. Lower = stops sooner with less
     # area covered; higher = visits more nooks (slower, more revisits).
-    # 70% is a good "significant coverage" target.
-    coverage_target_percent: 70.0
+    # Set high (95+) so coverage runs until natural completion / stagnation
+    # rather than an arbitrary cap — utility selection + region injector
+    # will push past 70% productively.
+    coverage_target_percent: 95.0
 
     # ── Next-Best-View mode (set coverage_mode: "nbv") ──────────────────
     # Surveillance / gas-mapping style coverage: the rover drives to the

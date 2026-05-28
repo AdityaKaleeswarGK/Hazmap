@@ -169,7 +169,7 @@ class HazMapNode(Node):
             known_map_mode=self.known_map_mode,
         )
         self.rcg = RCG(self.w, self.ogm)
-        self.goal_selector = GoalSelector(self.rcg)
+        self.goal_selector = GoalSelector(self.rcg, ogm=self.ogm, rc=self.rc)
         self.tsp_solver = TSPSolver(self.rcg)
         self.stc_planner = SpiralSTCPlanner(self.ogm, cell_size_m=self.stc_cell_size)
         self.boustro_planner = BoustrophedonPlanner(
@@ -448,6 +448,11 @@ class HazMapNode(Node):
         # so the run terminates instead of livelocking on the same cell.
         frontier_no_gain = 0
         FRONTIER_NO_GAIN_PATIENCE = 4
+        # Region-aware injector: every N successful cstar arrivals, force a
+        # jump to the largest distant frontier cluster so isolated regions
+        # don't get starved while the lap selector loops locally.
+        region_inject_counter = 0
+        REGION_INJECT_INTERVAL = 12
 
         # Configurable early termination: stop when coverage_target_percent
         # is reached even in unknown-map mode. Set to >100 to disable.
@@ -597,6 +602,11 @@ class HazMapNode(Node):
 
                 # Incremental sampling + RCG expansion (Algorithm 4 lines 3-7)
                 inc_samples = self.sampler.generate_samples(rx, ry)
+                # Off-grid cluster seeds: also add OPEN nodes at frontier
+                # cluster centroids so every opening (narrow / oblique /
+                # between-lap) has a goal node and the utility selector can
+                # see them as candidates.
+                inc_samples.extend(self._cluster_samples_from_grid())
                 if inc_samples:
                     self.frontier_samples = list(inc_samples)
                     inc_ids = self.rcg.expand(inc_samples)
@@ -606,6 +616,15 @@ class HazMapNode(Node):
                             f'  Incremental: {len(inc_samples)} samples, '
                             f'{len(inc_ids)} new nodes'
                         )
+
+                # Region-aware injector: every N cstar arrivals, force a
+                # cross-map jump to the largest distant frontier cluster, so
+                # remote unexplored regions don't get starved by local lap
+                # selection (the bottom-right-unknown case).
+                region_inject_counter += 1
+                if region_inject_counter >= REGION_INJECT_INTERVAL:
+                    region_inject_counter = 0
+                    self._inject_region_jump(rx, ry, failed_frontiers)
 
                 # Early termination: declare done once enough area has been seen,
                 # OR once we've stopped meaningfully discovering / covering area.
@@ -1422,6 +1441,74 @@ class HazMapNode(Node):
         rx, ry = self._robot_x, self._robot_y
         self.rcg.close_nearby_nodes(rx, ry, self.rc)
         self.goal_selector.update_retreat_nodes(rx, ry)
+
+    def _cluster_samples_from_grid(self) -> list:
+        """Turn raw-grid frontier clusters into sampler-format tuples
+        (x, y, lap_index, lap_position, is_end), so the RCG gets OPEN nodes
+        at every opening, even ones the lap-grid sampler misses."""
+        if not self.ogm.ready:
+            return []
+        clusters = self.ogm.find_frontier_clusters(min_cluster_cells=4)
+        if not clusters:
+            return []
+        # Match ProgressiveSampler's lap convention.
+        sweep_x = self.sweep_direction == 'x'
+        perp_dx, perp_dy = (1.0, 0.0) if sweep_x else (0.0, 1.0)
+        sweep_dx, sweep_dy = (0.0, 1.0) if sweep_x else (1.0, 0.0)
+        out = []
+        for cx, cy, _size in clusters:
+            perp_proj = cx * perp_dx + cy * perp_dy
+            lap_index = int(round(perp_proj / self.w))
+            lap_pos = cx * sweep_dx + cy * sweep_dy
+            out.append((cx, cy, lap_index, lap_pos, False))
+        return out
+
+    def _inject_region_jump(
+        self, rx: float, ry: float, failed_frontiers: list
+    ) -> None:
+        """Pick the largest frontier cluster that is *not* blacklisted and
+        far from the current pose, drive there. Guarantees every distinct
+        region gets visited even if local selection is happy looping."""
+        clusters = self.ogm.find_frontier_clusters(
+            min_cluster_cells=5,
+            exclude=failed_frontiers,
+            exclude_radius=max(self.w, 0.50),
+        )
+        if not clusters:
+            return
+        # Score: prefer large clusters that are far from the rover.
+        best = None
+        best_score = -1.0
+        for cx, cy, size in clusters:
+            d = math.hypot(cx - rx, cy - ry)
+            score = float(size) * d
+            if score > best_score:
+                best_score = score
+                best = (cx, cy, size)
+        if best is None:
+            return
+        tx, ty = self._clamp_goal_to_map(best[0], best[1])
+        self.get_logger().info(
+            f'  Region injector → cluster size={best[2]} '
+            f'({tx:.2f},{ty:.2f}).'
+        )
+        visit_idx = self._log_visit('region_jump', tx, ty)
+        ok = self.navigator.go_to(
+            tx, ty, prefer_direct=False, timeout=120.0,
+        )
+        self._mark_visit_result(
+            visit_idx, 'arrived' if ok else 'nav_failed',
+        )
+        if ok:
+            self._add_pose(tx, ty)
+            self._mark_covered_to(tx, ty)
+            rx2, ry2 = self._robot_x, self._robot_y
+            self.rcg.close_nearby_nodes(rx2, ry2, self.rc)
+            nearest = self._nearest_node_id(tx, ty)
+            if nearest is not None:
+                self.current_node_id = nearest
+        else:
+            failed_frontiers.append((tx, ty))
 
     def _drive_route_ntp(self, waypoints, chunk_size: int = 25) -> int:
         """Drive a precomputed waypoint route in NavigateThroughPoses chunks.

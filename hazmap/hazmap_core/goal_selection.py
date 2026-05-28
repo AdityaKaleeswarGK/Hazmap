@@ -18,8 +18,21 @@ from .rcg import RCG, NodeState, RCGNode
 class GoalSelector:
     """Handles goal selection, state updates, and dead-end escape."""
 
-    def __init__(self, rcg: RCG):
+    def __init__(
+        self,
+        rcg: RCG,
+        ogm=None,
+        rc: float = 0.30,
+        alpha: float = 1.0,
+        candidate_pool: int = 12,
+        same_lap_bonus: float = 1.25,
+    ):
         self.rcg = rcg
+        self.ogm = ogm
+        self.rc = rc
+        self.alpha = alpha
+        self.candidate_pool = candidate_pool
+        self.same_lap_bonus = same_lap_bonus
         self.retreat_nodes: Set[int] = set()
 
     def select_goal_node(self, current_id: int) -> Optional[int]:
@@ -27,12 +40,63 @@ class GoalSelector:
         if node is None:
             return None
 
-        for direction in ["left", "up", "down", "right"]:
-            nb = self.rcg.get_open_neighbor(node, direction)
-            if nb is not None:
-                return nb.id
+        # Without an OGM reference we cannot score gain — fall back to the
+        # paper's fixed L→U→D→R lap priority (legacy behavior).
+        if self.ogm is None:
+            for direction in ["left", "up", "down", "right"]:
+                nb = self.rcg.get_open_neighbor(node, direction)
+                if nb is not None:
+                    return nb.id
+            return self._escape_dead_end(current_id)
 
-        return self._escape_dead_end(current_id)
+        # Utility-based selection: argmax (gain / cost^alpha), with a small
+        # same-lap bonus so the sweep pattern persists when costs tie.
+        # Candidates = OPEN direct neighbors + nearest OPEN nodes overall,
+        # so the selector can break out of a lap when something nearby is
+        # much more informative (e.g. an opening into an uncovered region).
+        candidates: Set[int] = set()
+        for direction in ["left", "up", "down", "right"]:
+            for nid in node.neighbors.get(direction, []):
+                n = self.rcg.nodes.get(nid)
+                if n is not None and n.state == NodeState.OPEN:
+                    candidates.add(nid)
+        nearest = sorted(
+            (
+                (math.hypot(self.rcg.nodes[nid].x - node.x,
+                            self.rcg.nodes[nid].y - node.y), nid)
+                for nid in self.rcg._open_ids
+                if nid in self.rcg.nodes
+            ),
+            key=lambda t: t[0],
+        )
+        for _, nid in nearest[: self.candidate_pool]:
+            candidates.add(nid)
+        if not candidates:
+            return self._escape_dead_end(current_id)
+
+        radius = max(self.rc, 0.5 * self.rcg.w)
+        best_id: Optional[int] = None
+        best_u = -1.0
+        for nid in candidates:
+            n = self.rcg.nodes.get(nid)
+            if n is None:
+                continue
+            gain = self.ogm.predict_coverage_gain(n.x, n.y, radius)
+            if gain <= 0:
+                continue
+            cost = max(0.1, math.hypot(n.x - node.x, n.y - node.y))
+            u = float(gain) / (cost ** self.alpha)
+            if n.lap_index == node.lap_index:
+                u *= self.same_lap_bonus
+            if u > best_u:
+                best_u = u
+                best_id = nid
+
+        if best_id is None:
+            # All nearby OPEN candidates would add zero new coverage — leave
+            # the local region via the dead-end escape (multi-target Dijkstra).
+            return self._escape_dead_end(current_id)
+        return best_id
 
     def update_state(self, current_id: int, goal_id: int) -> None:
         """Algorithm 2: Update the state of the current node.
