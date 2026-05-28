@@ -603,12 +603,60 @@ class OccupancyGridManager:
         scaled = np.clip(self._observation_quality * 100.0, 0, 100)
         return scaled.astype(np.int8)
 
-    def predict_coverage_gain(self, wx: float, wy: float, radius: float) -> int:
-        """Number of FREE cells within radius of (wx, wy) that are NOT yet
-        marked covered. Used by the utility-based goal selector to choose the
-        candidate that adds the most *new* swath, killing lap-priority bias
-        and redundant traversal of already-covered area."""
+    def predict_coverage_gain(
+        self,
+        wx: float,
+        wy: float,
+        radius: float,
+        lambda_unknown: float = 0.0,
+    ) -> float:
+        """Information-aware gain: uncovered FREE cells in the disk plus
+        lambda_unknown times the unknown-boundary cells (free↔unknown
+        adjacencies) inside the disk. With lambda_unknown=0 this reduces to
+        a pure swath count (legacy behavior). With lambda_unknown>0 the
+        selector also rewards candidates sitting on an unknown frontier —
+        i.e. places where moving the rover *reveals* new map."""
         if self._data is None:
+            return 0.0
+        gx0, gy0 = self.world_to_grid(wx, wy)
+        r_cells = max(1, int(radius / self._resolution))
+        x_min = max(0, gx0 - r_cells)
+        x_max = min(self._width, gx0 + r_cells + 1)
+        y_min = max(0, gy0 - r_cells)
+        y_max = min(self._height, gy0 + r_cells + 1)
+        if x_min >= x_max or y_min >= y_max:
+            return 0.0
+        sub = self._data[y_min:y_max, x_min:x_max]
+        free_mask = (sub >= 0) & (sub < self._free_threshold)
+        if self._covered_map is not None:
+            free_mask &= ~self._covered_map[y_min:y_max, x_min:x_max]
+        dy = np.arange(y_min, y_max) - gy0
+        dx = np.arange(x_min, x_max) - gx0
+        disk = (dy[:, None] ** 2 + dx[None, :] ** 2) <= r_cells * r_cells
+        swath = float(np.sum(free_mask & disk))
+        if lambda_unknown <= 0.0:
+            return swath
+        # Unknown-boundary cells: free cells adjacent to UNKNOWN, restricted
+        # to this disk. Reuse the global frontier mask so logic stays in one
+        # place (and the OGM keeps a single definition of "frontier").
+        fmask = self._frontier_mask()
+        if fmask is None:
+            return swath
+        unknown_boundary = float(
+            np.sum(fmask[y_min:y_max, x_min:x_max] & disk)
+        )
+        return swath + lambda_unknown * unknown_boundary
+
+    def find_frontier_cells_in_disk(
+        self, wx: float, wy: float, radius: float
+    ) -> int:
+        """Count uncovered free↔unknown boundary cells inside a disk —
+        used by RCG.reopen_stale_closed to detect when the post-close map
+        update has surfaced more to explore near a CLOSED node."""
+        if self._data is None:
+            return 0
+        fmask = self._frontier_mask()
+        if fmask is None:
             return 0
         gx0, gy0 = self.world_to_grid(wx, wy)
         r_cells = max(1, int(radius / self._resolution))
@@ -618,14 +666,60 @@ class OccupancyGridManager:
         y_max = min(self._height, gy0 + r_cells + 1)
         if x_min >= x_max or y_min >= y_max:
             return 0
-        sub = self._data[y_min:y_max, x_min:x_max]
-        free_mask = (sub >= 0) & (sub < self._free_threshold)
-        if self._covered_map is not None:
-            free_mask &= ~self._covered_map[y_min:y_max, x_min:x_max]
         dy = np.arange(y_min, y_max) - gy0
         dx = np.arange(x_min, x_max) - gx0
         disk = (dy[:, None] ** 2 + dx[None, :] ** 2) <= r_cells * r_cells
-        return int(np.sum(free_mask & disk))
+        return int(np.sum(fmask[y_min:y_max, x_min:x_max] & disk))
+
+    def local_complexity(
+        self,
+        wx: float,
+        wy: float,
+        radius: float,
+        obstacle_weight: float = 0.5,
+        boundary_weight: float = 0.5,
+    ) -> float:
+        """Local environmental complexity C ∈ [0, 1] used to modulate
+        sampling density. High in cluttered or frontier-rich regions
+        (obstacles nearby, lots of unknown boundary to inspect), low in
+        big open free zones. Result drives density-modulated keep in the
+        sampler — dense nodes where it matters, sparse where it doesn't."""
+        if self._data is None:
+            return 0.0
+        gx0, gy0 = self.world_to_grid(wx, wy)
+        r_cells = max(1, int(radius / self._resolution))
+        x_min = max(0, gx0 - r_cells)
+        x_max = min(self._width, gx0 + r_cells + 1)
+        y_min = max(0, gy0 - r_cells)
+        y_max = min(self._height, gy0 + r_cells + 1)
+        if x_min >= x_max or y_min >= y_max:
+            return 0.0
+        sub = self._data[y_min:y_max, x_min:x_max]
+        dy = np.arange(y_min, y_max) - gy0
+        dx = np.arange(x_min, x_max) - gx0
+        disk = (dy[:, None] ** 2 + dx[None, :] ** 2) <= r_cells * r_cells
+        disk_area = float(np.sum(disk))
+        if disk_area <= 0.0:
+            return 0.0
+        obstacle_mask = sub >= self._free_threshold
+        obstacle_density = float(np.sum(obstacle_mask & disk)) / disk_area
+        fmask = self._frontier_mask()
+        if fmask is not None:
+            boundary_density = float(
+                np.sum(fmask[y_min:y_max, x_min:x_max] & disk)
+            ) / disk_area
+        else:
+            boundary_density = 0.0
+        # Obstacle density saturates fast (a wall in view ≈ "cluttered"); use
+        # a 3x scaling so 33% obstacles in the disk → C contribution = 1.0
+        # before clamping. Boundary density is rarer; keep linear-ish but
+        # scale ×6 since frontier ribbons are thin.
+        c_obs = min(1.0, 3.0 * obstacle_density)
+        c_bnd = min(1.0, 6.0 * boundary_density)
+        total = obstacle_weight + boundary_weight
+        if total <= 0.0:
+            return 0.0
+        return min(1.0, (obstacle_weight * c_obs + boundary_weight * c_bnd) / total)
 
     # ------------------------------------------------------------------
     # Frontier clustering (reach non-lap-aligned openings)

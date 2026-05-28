@@ -25,14 +25,14 @@ class GoalSelector:
         rc: float = 0.30,
         alpha: float = 1.0,
         candidate_pool: int = 12,
-        same_lap_bonus: float = 1.25,
+        lambda_unknown: float = 0.0,
     ):
         self.rcg = rcg
         self.ogm = ogm
         self.rc = rc
         self.alpha = alpha
         self.candidate_pool = candidate_pool
-        self.same_lap_bonus = same_lap_bonus
+        self.lambda_unknown = lambda_unknown
         self.retreat_nodes: Set[int] = set()
 
     def select_goal_node(self, current_id: int) -> Optional[int]:
@@ -81,13 +81,13 @@ class GoalSelector:
             n = self.rcg.nodes.get(nid)
             if n is None:
                 continue
-            gain = self.ogm.predict_coverage_gain(n.x, n.y, radius)
+            gain = self.ogm.predict_coverage_gain(
+                n.x, n.y, radius, lambda_unknown=self.lambda_unknown,
+            )
             if gain <= 0:
                 continue
             cost = max(0.1, math.hypot(n.x - node.x, n.y - node.y))
             u = float(gain) / (cost ** self.alpha)
-            if n.lap_index == node.lap_index:
-                u *= self.same_lap_bonus
             if u > best_u:
                 best_u = u
                 best_id = nid

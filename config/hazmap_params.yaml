@@ -40,8 +40,36 @@ hazmap_node:
     nbv_n_rays: 72                # rays per viewpoint (raycast resolution)
     nbv_q_min: 0.4                # quality (0..1) at which a cell counts "observed"
     nbv_target_percent: 90.0      # stop once this much free space is observed
-    nbv_cost_weight: 1.0          # travel-cost exponent in gain/cost^alpha
+    nbv_cost_weight: 1.8          # travel-cost exponent in gain/cost^alpha
+                                  # (also drives cstar selector α; >1 = steeper
+                                  # distance penalty, prevents far-target picks
+                                  # when a nearer node has comparable gain)
     nbv_max_candidates: 40        # OPEN nodes evaluated per step (perf cap)
     nbv_min_gain: 1.0             # min quality-units a view must add to bother
     nbv_no_gain_patience: 8       # stop after this many no-gain/blocked steps
+
+    # ── Adaptive density + information-gain (cstar mode) ─────────────────
+    # Lap-grid samples are kept with probability
+    #   density_keep_floor + (1 - density_keep_floor) * complexity(x, y).
+    # 1.0 disables the filter (uniform sampling, legacy behavior). 0.35 means
+    # open empty regions keep ~35% of samples; cluttered/frontier-rich
+    # regions keep ~100%. Net: fewer total nodes, but they're concentrated
+    # where decisions matter (obstacle faces, unknown boundaries).
+    density_keep_floor: 0.35
+    complexity_radius: 0.0        # 0 → 1.5 * w. Disk radius for local C(x,y).
+    # Information-gain term: predict_coverage_gain returns
+    #   uncovered_free_cells + info_gain_lambda * unknown_boundary_cells.
+    # Higher = candidate scoring rewards "sit on the unknown frontier"
+    # alongside "add to swath." 0 disables (pure swath count, legacy).
+    info_gain_lambda: 1.5
+    # Map-revision rethink: every reopen_interval cstar arrivals, CLOSED
+    # nodes are re-checked. A node is flipped back to OPEN if its current
+    # local frontier-cell count exceeds reopen_growth_threshold × the count
+    # at the time it was closed, AND has grown by at least
+    # reopen_min_new_frontier cells. Bounded by reopen_max_per_node so a
+    # single node can't oscillate (guarantees termination).
+    reopen_interval: 8
+    reopen_growth_threshold: 1.8
+    reopen_min_new_frontier: 6
+    reopen_max_per_node: 2
 

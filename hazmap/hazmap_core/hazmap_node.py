@@ -83,6 +83,22 @@ class HazMapNode(Node):
         self.declare_parameter('nbv_max_candidates', 40)
         self.declare_parameter('nbv_min_gain', 1.0)          # quality units to bother
         self.declare_parameter('nbv_no_gain_patience', 8)
+        # ── Adaptive density + information-gain (cstar mode) ─────────────
+        # density_keep_floor=1.0 disables the density filter (legacy uniform
+        # lap sampling). Lower values thin samples in open regions while
+        # keeping them dense at obstacles and frontiers.
+        self.declare_parameter('density_keep_floor', 0.35)
+        self.declare_parameter('complexity_radius', 0.0)  # 0 → 1.5*w
+        # info_gain_lambda weighs unknown-boundary cells against
+        # uncovered-free cells in predict_coverage_gain. 0 = pure swath
+        # count, larger = also reward sitting on the unknown frontier.
+        self.declare_parameter('info_gain_lambda', 1.5)
+        # CLOSED-node reopen: flips CLOSED nodes back to OPEN when the
+        # OGM update reveals significantly more unknown near them.
+        self.declare_parameter('reopen_interval', 8)             # cstar arrivals
+        self.declare_parameter('reopen_growth_threshold', 1.8)
+        self.declare_parameter('reopen_min_new_frontier', 6)
+        self.declare_parameter('reopen_max_per_node', 2)
 
         self.w = self.get_parameter('w').value
         self.rc = self.get_parameter('rc').value
@@ -151,6 +167,18 @@ class HazMapNode(Node):
         self.nbv_max_candidates = self.get_parameter('nbv_max_candidates').value
         self.nbv_min_gain = self.get_parameter('nbv_min_gain').value
         self.nbv_no_gain_patience = self.get_parameter('nbv_no_gain_patience').value
+        self.density_keep_floor = self.get_parameter('density_keep_floor').value
+        _crad = self.get_parameter('complexity_radius').value
+        self.complexity_radius = _crad if _crad > 0.0 else 1.5 * self.w
+        self.info_gain_lambda = self.get_parameter('info_gain_lambda').value
+        self.reopen_interval = int(self.get_parameter('reopen_interval').value)
+        self.reopen_growth_threshold = self.get_parameter('reopen_growth_threshold').value
+        self.reopen_min_new_frontier = int(
+            self.get_parameter('reopen_min_new_frontier').value
+        )
+        self.reopen_max_per_node = int(
+            self.get_parameter('reopen_max_per_node').value
+        )
 
         # ── C* core algorithm objects ────────────────────────────────
         self.ogm = OccupancyGridManager(free_threshold=50)
@@ -167,9 +195,17 @@ class HazMapNode(Node):
             sweep_dir,
             self.ogm,
             known_map_mode=self.known_map_mode,
+            density_keep_floor=self.density_keep_floor,
+            complexity_radius=self.complexity_radius,
         )
         self.rcg = RCG(self.w, self.ogm)
-        self.goal_selector = GoalSelector(self.rcg, ogm=self.ogm, rc=self.rc)
+        self.goal_selector = GoalSelector(
+            self.rcg,
+            ogm=self.ogm,
+            rc=self.rc,
+            alpha=self.nbv_cost_weight,
+            lambda_unknown=self.info_gain_lambda,
+        )
         self.tsp_solver = TSPSolver(self.rcg)
         self.stc_planner = SpiralSTCPlanner(self.ogm, cell_size_m=self.stc_cell_size)
         self.boustro_planner = BoustrophedonPlanner(
@@ -177,16 +213,9 @@ class HazMapNode(Node):
             lap_spacing_m=self.lawnmower_spacing,
             boundary_margin_m=self.lawnmower_boundary_margin,
         )
-        self.nbv_selector = NextBestViewSelector(
-            self.rcg,
-            self.ogm,
-            sensor_range=self.sensor_range,
-            fov_deg=self.sensor_fov_deg,
-            n_rays=int(self.nbv_n_rays),
-            q_min=self.nbv_q_min,
-            cost_weight=self.nbv_cost_weight,
-            max_candidates=int(self.nbv_max_candidates),
-        )
+        # NBV selector is only used in coverage_mode='nbv'; build it lazily
+        # in run_coverage_nbv so cstar mode doesn't carry the precompute.
+        self.nbv_selector = None
         self.navigator = None  # initialised in run_coverage
         self._coverage_anchor = None
 
@@ -448,11 +477,12 @@ class HazMapNode(Node):
         # so the run terminates instead of livelocking on the same cell.
         frontier_no_gain = 0
         FRONTIER_NO_GAIN_PATIENCE = 4
-        # Region-aware injector: every N successful cstar arrivals, force a
-        # jump to the largest distant frontier cluster so isolated regions
-        # don't get starved while the lap selector loops locally.
-        region_inject_counter = 0
-        REGION_INJECT_INTERVAL = 12
+        # Map-revision rethink: every reopen_interval cstar arrivals, scan
+        # CLOSED nodes and flip back to OPEN any whose local frontier has
+        # grown materially since closure. Replaces the older "region jump
+        # every N steps" heuristic with a principled signal driven by OGM
+        # updates — i.e. we only reconsider regions when the map says so.
+        reopen_counter = 0
 
         # Configurable early termination: stop when coverage_target_percent
         # is reached even in unknown-map mode. Set to >100 to disable.
@@ -617,14 +647,26 @@ class HazMapNode(Node):
                             f'{len(inc_ids)} new nodes'
                         )
 
-                # Region-aware injector: every N cstar arrivals, force a
-                # cross-map jump to the largest distant frontier cluster, so
-                # remote unexplored regions don't get starved by local lap
-                # selection (the bottom-right-unknown case).
-                region_inject_counter += 1
-                if region_inject_counter >= REGION_INJECT_INTERVAL:
-                    region_inject_counter = 0
-                    self._inject_region_jump(rx, ry, failed_frontiers)
+                # Periodic reopen: let the OGM tell us when to rethink a
+                # closed region. Bounded by reopen_max_per_node so a single
+                # node can't oscillate forever.
+                reopen_counter += 1
+                if (
+                    self.reopen_interval > 0
+                    and reopen_counter >= self.reopen_interval
+                ):
+                    reopen_counter = 0
+                    reopened = self.rcg.reopen_stale_closed(
+                        growth_threshold=self.reopen_growth_threshold,
+                        min_new_frontier=self.reopen_min_new_frontier,
+                        max_reopens_per_node=self.reopen_max_per_node,
+                        radius=max(self.rc, self.w),
+                    )
+                    if reopened and self.debug:
+                        self.get_logger().info(
+                            f'  Reopen: {len(reopened)} CLOSED nodes flipped '
+                            f'back to OPEN (post-OGM-update rethink).'
+                        )
 
                 # Early termination: declare done once enough area has been seen,
                 # OR once we've stopped meaningfully discovering / covering area.
@@ -1105,6 +1147,17 @@ class HazMapNode(Node):
         (sensor_range) rather than by driving over them."""
         self.coverage_running = True
         self.coverage_complete = False
+        if self.nbv_selector is None:
+            self.nbv_selector = NextBestViewSelector(
+                self.rcg,
+                self.ogm,
+                sensor_range=self.sensor_range,
+                fov_deg=self.sensor_fov_deg,
+                n_rays=int(self.nbv_n_rays),
+                q_min=self.nbv_q_min,
+                cost_weight=self.nbv_cost_weight,
+                max_candidates=int(self.nbv_max_candidates),
+            )
         self.get_logger().info('═══ HAZMAP COVERAGE STARTING (Next-Best-View) ═══')
 
         self.get_logger().info('Waiting for /map …')
@@ -1448,7 +1501,11 @@ class HazMapNode(Node):
         at every opening, even ones the lap-grid sampler misses."""
         if not self.ogm.ready:
             return []
-        clusters = self.ogm.find_frontier_clusters(min_cluster_cells=4)
+        # min_cluster_cells=12 ≈ 0.12 m² of frontier — filters out trivial
+        # nubs that would just add noise to the candidate pool. Cluster
+        # seeds bypass the sampler's density filter because they're by
+        # definition in high-complexity (frontier-rich) areas.
+        clusters = self.ogm.find_frontier_clusters(min_cluster_cells=12)
         if not clusters:
             return []
         # Match ProgressiveSampler's lap convention.
@@ -1462,53 +1519,6 @@ class HazMapNode(Node):
             lap_pos = cx * sweep_dx + cy * sweep_dy
             out.append((cx, cy, lap_index, lap_pos, False))
         return out
-
-    def _inject_region_jump(
-        self, rx: float, ry: float, failed_frontiers: list
-    ) -> None:
-        """Pick the largest frontier cluster that is *not* blacklisted and
-        far from the current pose, drive there. Guarantees every distinct
-        region gets visited even if local selection is happy looping."""
-        clusters = self.ogm.find_frontier_clusters(
-            min_cluster_cells=5,
-            exclude=failed_frontiers,
-            exclude_radius=max(self.w, 0.50),
-        )
-        if not clusters:
-            return
-        # Score: prefer large clusters that are far from the rover.
-        best = None
-        best_score = -1.0
-        for cx, cy, size in clusters:
-            d = math.hypot(cx - rx, cy - ry)
-            score = float(size) * d
-            if score > best_score:
-                best_score = score
-                best = (cx, cy, size)
-        if best is None:
-            return
-        tx, ty = self._clamp_goal_to_map(best[0], best[1])
-        self.get_logger().info(
-            f'  Region injector → cluster size={best[2]} '
-            f'({tx:.2f},{ty:.2f}).'
-        )
-        visit_idx = self._log_visit('region_jump', tx, ty)
-        ok = self.navigator.go_to(
-            tx, ty, prefer_direct=False, timeout=120.0,
-        )
-        self._mark_visit_result(
-            visit_idx, 'arrived' if ok else 'nav_failed',
-        )
-        if ok:
-            self._add_pose(tx, ty)
-            self._mark_covered_to(tx, ty)
-            rx2, ry2 = self._robot_x, self._robot_y
-            self.rcg.close_nearby_nodes(rx2, ry2, self.rc)
-            nearest = self._nearest_node_id(tx, ty)
-            if nearest is not None:
-                self.current_node_id = nearest
-        else:
-            failed_frontiers.append((tx, ty))
 
     def _drive_route_ntp(self, waypoints, chunk_size: int = 25) -> int:
         """Drive a precomputed waypoint route in NavigateThroughPoses chunks.

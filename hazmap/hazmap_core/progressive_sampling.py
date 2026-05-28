@@ -35,6 +35,8 @@ class ProgressiveSampler:
         sweep_dir: Tuple[float, float],
         ogm: OccupancyGridManager,
         known_map_mode: bool = False,
+        density_keep_floor: float = 1.0,
+        complexity_radius: Optional[float] = None,
     ):
         """
         Parameters
@@ -45,11 +47,22 @@ class ProgressiveSampler:
                     (laps run along sweep_dir, lap shifting is
                      perpendicular to it)
         ogm : shared OccupancyGridManager
+        density_keep_floor : minimum probability that a lap-grid sample is
+            kept regardless of local complexity. 1.0 disables the filter
+            (legacy uniform sampling). 0.3 means open empty regions keep
+            ~30% of samples; high-complexity regions keep ~100%.
+        complexity_radius : disk radius (m) used when querying
+            OGM.local_complexity. Defaults to 1.5*w if None.
         """
         self.w = w
         self.rd = rd
         self.ogm = ogm
         self.known_map_mode = known_map_mode
+        self.density_keep_floor = max(0.0, min(1.0, density_keep_floor))
+        self.complexity_radius = (
+            complexity_radius if complexity_radius is not None else 1.5 * w
+        )
+        self._rng = np.random.default_rng(0)
         # Sweep direction (unit vector) – laps extend along this direction
         mag = math.hypot(sweep_dir[0], sweep_dir[1]) or 1.0
         self.sweep_dx = sweep_dir[0] / mag
@@ -173,6 +186,20 @@ class ProgressiveSampler:
 
                     if not shifted:
                         continue  # Even dragged back 0.40m it's lethal, discard this sample
+
+                # Density-modulated keep: in low-complexity (open, empty)
+                # regions, drop most candidates probabilistically; in
+                # high-complexity (cluttered / frontier-rich) regions, keep
+                # them all. Mark cell sampled either way so we don't
+                # repeatedly reroll the same bucket — that's both wasteful
+                # and would let coverage stall on a string of unlucky
+                # rejects. Floor of 1.0 disables the filter entirely.
+                if self.density_keep_floor < 1.0:
+                    c = self.ogm.local_complexity(sx, sy, self.complexity_radius)
+                    keep_p = self.density_keep_floor + (1.0 - self.density_keep_floor) * c
+                    if self._rng.random() > keep_p:
+                        self._sampled_cells.add(cell_key)
+                        continue
 
                 # Determine if this is an end node (at the end of a lap)
                 is_end = self._is_lap_end(sx, sy)
