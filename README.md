@@ -1,44 +1,121 @@
-# HazMap — Hazard Mapping & Coverage Path Planning
+# HazMap — Coverage Path Planning with C*
 
-> Autonomous hazard mapping system for TurtleBot3 on **ROS 2 Humble**.  
-> Combines coverage path planning, simulated environmental sensors, and an optional YOLO-based visual detection pipeline to build consolidated hazard impact maps.
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Features](#features)
-- [Project Structure](#project-structure)
-- [Prerequisites](#prerequisites)
-- [Configuration](#configuration)
-  - [Sensors](#sensors)
-  - [Visual Detection Classes](#visual-detection-classes)
-  - [Navigation Parameters](#navigation-parameters)
-- [Usage](#usage)
-  - [Launch](#launch)
-  - [Start / Stop Coverage](#start--stop-coverage)
-  - [Enabling the CV Detection Pipeline](#enabling-the-cv-detection-pipeline)
-- [ROS 2 Topics & Services](#ros-2-topics--services)
-- [Output & Results](#output--results)
-- [Architecture](#architecture)
+Autonomous coverage path planning for TurtleBot3 on **ROS 2 Humble**, built around a modified **C\*** algorithm. The robot explores an unknown environment incrementally, building a Reachability Connectivity Graph (RCG) as the map grows, and drives the robot along boustrophedon laps until the full navigable area is covered.
 
 ---
 
-## Overview
+## Algorithm Overview
 
-HazMap drives a TurtleBot3 (Waffle) through an unknown environment using a progressive frontier-based coverage algorithm built on a **Reachability Connectivity Graph (RCG)**. As the robot moves, environmental sensors are sampled and an optional camera-based YOLO detector localises visual hazards. All data is fused into a **consolidated hazard impact map** with priority-weighted overlays and saved as publication-ready figures.
+The implementation follows the C\* coverage algorithm with several practical modifications for real-world robot operation.
 
-## Features
+### 1. Progressive Sampling
 
-| Category | Details |
-|---|---|
-| **Coverage Planning** | Progressive frontier sampling, boustrophedon sweep, RCG expansion/pruning, dead-end escape via graph search |
-| **Hybrid Navigation** | Direct LiDAR-safe local planner with automatic Nav2 fallback |
-| **Environmental Sensors** | Simulated CO, CO₂, Methane, O₂ with Gaussian-splash heatmaps |
-| **Visual Detection** | Optional YOLO pipeline — RGB+Depth → 3D map-frame localisation with EMA tracking and duplicate suppression |
-| **Consolidated Map** | Priority-weighted fusion of all sensor and detection data into a single hazard impact map |
-| **Visualisation** | Real-time RViz markers (RCG nodes/edges, sensor cylinders, detection pins) + saved PNG result figures |
+At each step, the robot samples the newly revealed free space within its detection radius (`rd`). Samples are placed on parallel laps spaced `w` metres apart, oriented along the chosen sweep axis. Only samples adjacent to unknown space or obstacles (i.e., on the frontier) are retained — this keeps the graph sparse and focused on regions that still need covering.
+
+### 2. Reachability Connectivity Graph (RCG)
+
+Frontier samples become nodes in the RCG. Each node carries:
+- Its world position `(x, y)` and which lap it belongs to
+- State: **OPEN** (not yet visited) or **CLOSED** (covered)
+- Directional neighbor lists: `up`, `down` (same lap), `left`, `right` (adjacent laps)
+
+The graph is built incrementally as the robot moves:
+- **Expand** — add new nodes from the latest frontier samples and connect them to existing nodes (same-lap neighbors and cross-lap neighbors within `√2 · w`).
+- **Prune** — remove inessential nodes. A node is *essential* if it borders unknown space, is an end node of its lap, or is the only cross-lap bridge to an end node on an adjacent lap. Everything else is pruned to keep the graph lean.
+
+### 3. Goal Selection
+
+At every step the selector picks the next OPEN node to visit. Priority order: left-lap neighbor → up-lap neighbor → down-lap neighbor → right-lap neighbor. When no adjacent neighbor is available (dead end), A\* on the RCG finds the nearest reachable OPEN node.
+
+Two practical modifications over the original algorithm:
+
+- **Local commitment** (`commit_threshold`): a nearby same-lap neighbor wins over a distant candidate unless the distant one offers more than `1/commit_threshold` times the coverage gain. This keeps the robot sweeping locally rather than jumping across the map.
+- **Path-cost penalty** (`path_blocked_penalty`): if the straight line to a candidate is collision-blocked, its effective cost is multiplied by this factor. Prevents the selector from picking a geometrically close node that is physically far around a wall.
+
+### 4. Coverage Tracking
+
+The occupancy grid manager tracks which free cells have been visited. A cell is marked covered when the robot passes within `rc` metres of it. Coverage is tracked both at waypoints and along traversed segments (interpolated between waypoints) so narrow corridors are counted correctly.
+
+### 5. Termination
+
+The run stops under any of three conditions:
+- **Target reached**: coverage exceeds 95% of known free space.
+- **Stagnation**: neither covered area nor discovered free area has grown meaningfully in the last 8 arrivals.
+- **Diminishing returns**: coverage-per-metre-travelled over a rolling window falls below threshold while coverage is already above 80%.
+
+A safety-net frontier-cluster search runs when no lap samples remain but the map still has unexplored openings — this catches narrow passages and off-axis gaps the lap sampler misses.
+
+---
+
+## Architecture
+
+```
+                        ┌─────────────────────────────────────────────────┐
+                        │                  HazMapNode                     │
+                        │           (hazmap_core/hazmap_node.py)          │
+                        │                                                 │
+   /map ───────────────►│  ┌──────────────────────┐                      │
+   /odom ──────────────►│  │ OccupancyGridManager │                      │
+   /scan ──────────────►│  │                      │  frontier queries     │
+                        │  │  • free/unknown/occ  │◄─────────────────┐   │
+                        │  │  • coverage tracking │                  │   │
+                        │  │  • obstacle distance │                  │   │
+                        │  └──────────┬───────────┘                  │   │
+                        │             │ grid state                    │   │
+                        │  ┌──────────▼───────────┐                  │   │
+                        │  │  ProgressiveSampler  │                  │   │
+                        │  │                      │  (x,y,lap,pos)   │   │
+                        │  │  • lap grid at w m   ├──────────────►   │   │
+                        │  │  • frontier samples  │                  │   │
+                        │  │  • coverage mask     │          ┌───────┴───┴──────┐
+                        │  └──────────────────────┘          │       RCG        │
+                        │                                    │                  │
+                        │                                    │  • expand()      │
+                        │                                    │  • prune()       │
+                        │                                    │  • A* search     │
+                        │                                    │  • OPEN/CLOSED   │
+                        │                                    └───────┬──────────┘
+                        │                                            │ next node
+                        │  ┌─────────────────────────────────────────▼──────┐  │
+                        │  │               GoalSelector                     │  │
+                        │  │                                                │  │
+                        │  │  SelectGoalNode: Left→Up→Down→Right            │  │
+                        │  │  local commitment  │  path-cost penalty        │  │
+                        │  │  dead-end escape via RCG A*                    │  │
+                        │  └─────────────────────────┬──────────────────────┘  │
+                        │                            │ (x, y) goal             │
+                        │  ┌─────────────────────────▼──────────────────────┐  │
+                        │  │                  Navigator                     │  │
+                        │  │                                                │  │
+                        │  │  Nav2 NavigateToPose / NavigateThroughPoses    │  │
+                        │  │  optional: direct velocity control (/cmd_vel)  │  │
+                        │  └─────────────────────────┬──────────────────────┘  │
+                        │                            │                         │
+                        └────────────────────────────┼─────────────────────────┘
+                                                     │
+                                          ┌──────────▼──────────┐
+                                          │    TurtleBot3 +      │
+                                          │    Nav2 + SLAM       │
+                                          └─────────────────────┘
+```
+
+**Data flow per step:**
+1. `OccupancyGridManager` ingests the latest `/map` and tracks covered cells.
+2. `ProgressiveSampler` places frontier samples on parallel laps within the robot's detection radius.
+3. `RCG.expand()` adds new nodes; `RCG.prune()` removes inessential ones.
+4. `GoalSelector.select_goal_node()` picks the next OPEN node (left-lap preferred; falls back to A\* on dead end).
+5. `Navigator` drives the robot there via Nav2; on arrival `close_nearby_nodes()` marks covered nodes CLOSED.
+6. Repeat until termination (coverage target, stagnation, or diminishing returns).
+
+---
+
+## Stack
+
+- **ROS 2 Humble** on Ubuntu 22.04
+- **TurtleBot3 Burger** (example platform; any differential-drive robot works)
+- **Nav2** for global path following
+- **SLAM Toolbox** for online mapping
+- Navigation: Nav2 `NavigateToPose` / `NavigateThroughPoses`, with optional direct velocity control for short collision-free hops
 
 ---
 
@@ -48,56 +125,25 @@ HazMap drives a TurtleBot3 (Waffle) through an unknown environment using a progr
 hazmap/
 ├── config/
 │   ├── hazmap_params.yaml          # All tunable parameters
-│   ├── hazmap.rviz                 # RViz display config
-│   └── nav2_params.yaml            # Nav2 planner/controller params
-│
+│   ├── nav2_params.yaml            # Nav2 planner/controller params
+│   └── slam_toolbox_params.yaml    # SLAM Toolbox params
 ├── launch/
 │   └── hazmap.launch.py            # Launches Gazebo, SLAM, Nav2, HazMap, RViz
-│
-├── model/                          # Place YOLO model here to enable CV pipeline
-│   └── .gitkeep
-│
 ├── hazmap/
-│   ├── __init__.py
-│   │
-│   ├── hazmap_core/                # Core coverage planning modules
-│   │   ├── __init__.py
-│   │   ├── hazmap_node.py          # Main ROS 2 node — orchestrates everything
-│   │   ├── map_manager.py          # Occupancy grid, frontier masks, coverage masks
-│   │   ├── sampling.py             # Progressive frontier sampling
-│   │   ├── rcg.py                  # Reachability Connectivity Graph
-│   │   ├── waypoint_selector.py    # Boustrophedon sweep waypoint selection
-│   │   ├── navigator.py            # Hybrid navigation (direct + Nav2 fallback)
-│   │   └── utils.py                # Grid/world conversions, collision checks
-│   │
-│   └── pipeline/                   # Sensor + CV detection pipeline
-│       ├── __init__.py
-│       ├── sensor_manager.py       # Sensor simulation, marker publishing, heatmap saving
-│       └── detection_manager.py    # YOLO detection, 3D localisation, object tracking
-│
-├── resource/
-│   └── hazmap
-├── test/
-│   ├── test_copyright.py
-│   ├── test_flake8.py
-│   └── test_pep257.py
-│
+│   └── hazmap_core/
+│       ├── hazmap_node.py          # Main ROS 2 node — orchestrates everything
+│       ├── occupancy_grid_manager.py  # Grid queries, frontier detection, coverage stats
+│       ├── progressive_sampling.py    # Lap-based frontier sampling
+│       ├── rcg.py                     # RCG: expand, prune, A*
+│       ├── goal_selection.py          # SelectGoalNode, UpdateState, dead-end escape
+│       └── navigator.py               # Nav2 action client + direct velocity control
 ├── package.xml
 ├── setup.py
-├── setup.cfg
-├── requirements.txt
-└── README.md
+└── requirements.txt
 ```
 
 ---
 
-## Prerequisites
-
-- **ROS 2 Humble** (Ubuntu 22.04)
-- **TurtleBot3 packages** (`turtlebot3_gazebo`, `turtlebot3_description`)
-- **Nav2** (`nav2_bringup`)
-- **SLAM Toolbox** (`slam_toolbox`)
-- **Python 3.10+**
 ## Installation
 
 ```bash
@@ -108,234 +154,79 @@ pip install -r hazmap/requirements.txt
 
 cd ~/ros2_ws
 rosdep install --from-paths src --ignore-src -r -y
-
 colcon build --packages-select hazmap --symlink-install
-
 source install/setup.bash
 ```
 
 ---
 
-## Configuration
-
-All parameters live in **`config/hazmap_params.yaml`** under the `hazmap_node` namespace.
-
-### Sensors
-
-Four environmental sensors are defined by default, each with a name, unit, and priority (lower = higher importance in the consolidated map):
-
-| Sensor  | Unit | Priority |
-|---------|------|----------|
-| CO      | ppm  | 1        |
-| CO₂     | ppm  | 2        |
-| Methane | ppm  | 3        |
-| O₂      | %    | 4        |
-
-```yaml
-sensor_names:      ["co",  "co2", "methane", "o2"]
-sensor_units:      ["ppm", "ppm", "ppm",     "%"]
-sensor_priorities: [1,     2,     3,         4]
-```
-
-### Visual Detection Classes
-
-Five YOLO detection classes are configured with severity priorities (lower = more severe):
-
-| Class | Description | Priority |
-|-------|-------------|----------|
-| Fire in shrouded environments | `fire` | 1 (most severe) |
-| Smoke | `smoke` | 2 |
-| Spills in shrouded environments | `spills_shrouded` | 3 |
-| Translucent spills | `translucent_spills` | 4 |
-| Distinctly coloured spills | `coloured_spills` | 5 (least severe) |
-
-```yaml
-detection_class_names: [
-  "coloured_spills",
-  "fire",
-  "spills_shrouded",
-  "smoke",
-  "translucent_spills"
-]
-detection_priorities: [5, 1, 3, 2, 4]
-```
-
-### Navigation Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `w` | 0.75 | Lap spacing (metres) |
-| `delta` | 1 | Sample spacing multiplier |
-| `sweep_direction` | `"x"` | `"x"` = vertical laps, `"y"` = horizontal |
-| `use_hybrid_navigation` | `true` | Enable direct LiDAR-safe planner |
-| `direct_nav_max_distance` | 0.70 | Max edge length for direct mode (m) |
-| `direct_nav_linear_speed` | 0.20 | Forward speed for direct mode (m/s) |
-| `direct_nav_angular_speed` | 1.00 | Turning speed (rad/s) |
-| `direct_nav_min_clearance` | 0.18 | Min obstacle clearance for direct mode (m) |
-| `direct_nav_fallback_to_nav2` | `true` | Fall back to Nav2 on direct failure |
-
-See `config/hazmap_params.yaml` for the full parameter list.
-
----
-
 ## Usage
 
-### Launch
-
 ```bash
-# Set TurtleBot3 model (default: waffle)
-export TURTLEBOT3_MODEL=waffle
+export TURTLEBOT3_MODEL=burger
 
-# Launch everything: Gazebo + SLAM + Nav2 + HazMap + RViz
+# Launch Gazebo + SLAM Toolbox + Nav2 + HazMap + RViz
 ros2 launch hazmap hazmap.launch.py
-```
 
-
-### Start / Stop Coverage
-
-```bash
-# Start autonomous coverage
+# In another terminal — start coverage
 ros2 service call /hazmap/start_coverage std_srvs/srv/Trigger
 
-# Stop coverage (the robot will halt and save results)
+# Stop early (saves visit log)
 ros2 service call /hazmap/stop_coverage std_srvs/srv/Trigger
 ```
 
-Coverage also saves results automatically when the frontier is exhausted, or on `Ctrl+C`.
+---
 
-### Enabling the CV Detection Pipeline
+## Key Parameters (`config/hazmap_params.yaml`)
 
-The visual detection pipeline is **conditionally enabled**. To activate it:
-
-1. Place a YOLO model file (`.pt`, `.onnx`, or `.engine`) in the `model/` directory:
-   ```bash
-   cp /path/to/your/yolov8n.pt ~/ros2_ws/src/hazmap/model/
-   ```
-2. Install the optional dependencies:
-   ```bash
-   pip install ultralytics opencv-python
-   ```
-3. Rebuild and relaunch.
-
-If the `model/` directory is empty or `ultralytics` is not installed, the CV pipeline is silently disabled and the rest of the system runs normally.
-
-The detection pipeline:
-- Subscribes to synchronised RGB + Depth camera topics
-- Runs YOLO inference on each frame
-- Projects detections to 3D using camera intrinsics and depth
-- Transforms 3D points from camera frame to map frame via TF2
-- Tracks unique objects with EMA position updates and duplicate suppression
-- Publishes coloured sphere + text markers to RViz on `/hazmap/detections`
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `w` | 0.50 m | Lap spacing |
+| `rc` | 0.30 m | Coverage radius per waypoint |
+| `rd` | 3.0 m | Detection / sampling radius |
+| `sweep_direction` | `"x"` | `"x"` = vertical laps, `"y"` = horizontal |
+| `use_hybrid_navigation` | `false` | Enable direct velocity control for short hops |
+| `commit_threshold` | 0.30 | Local-commitment bias (lower = stronger local preference) |
+| `path_blocked_penalty` | 3.0 | Cost multiplier for collision-blocked candidates |
+| `nav_step_timeout_s` | 50.0 | Per-step Nav2 timeout (seconds) |
+| `prune_enable` | `true` | Prune covered OPEN nodes to reduce overlap |
+| `eff_stop_enable` | `true` | Stop on diminishing-returns criterion |
+| `eff_stop_min_coverage` | 80.0 % | Minimum coverage before efficiency stop kicks in |
 
 ---
 
-## ROS 2 Topics & Services
+## ROS 2 Interface
 
 ### Published Topics
 
 | Topic | Type | Description |
 |-------|------|-------------|
-| `/hazmap/rcg_nodes` | `MarkerArray` | RCG node spheres (green=open, red=closed, yellow=current) |
-| `/hazmap/rcg_edges` | `MarkerArray` | RCG edge lines (yellow=same-lap, cyan=cross-lap) |
-| `/hazmap/current_goal` | `Marker` | Current navigation goal sphere |
+| `/hazmap/rcg_nodes` | `MarkerArray` | RCG nodes (green=OPEN, red=CLOSED, yellow=current) |
+| `/hazmap/rcg_edges` | `MarkerArray` | RCG edges (yellow=same-lap, cyan=cross-lap) |
+| `/hazmap/current_goal` | `Marker` | Current navigation target |
 | `/hazmap/coverage_path` | `Path` | Sequence of visited waypoints |
-| `/hazmap/robot_trajectory` | `Path` | Dense real-time robot trajectory |
-| `/hazmap/laps` | `MarkerArray` | Coloured lap lines |
-| `/hazmap/frontier_points` | `MarkerArray` | Current frontier sample points |
-| `/hazmap/detections` | `MarkerArray` | Detected object pins + labels (if CV enabled) |
-| `/hazmap/<sensor>_markers` | `MarkerArray` | Per-sensor reading cylinders (e.g. `/hazmap/co_markers`) |
+| `/hazmap/robot_trajectory` | `Path` | Dense real-time trajectory |
+| `/hazmap/laps` | `MarkerArray` | Colour-coded lap lines |
+| `/hazmap/frontier_points` | `MarkerArray` | Current frontier samples |
+| `/hazmap/observation_quality` | `OccupancyGrid` | Coverage density grid |
 
 ### Subscribed Topics
 
-| Topic | Type | Description |
-|-------|------|-------------|
-| `/map` | `OccupancyGrid` | SLAM occupancy grid |
-| `/odom` | `Odometry` | Robot odometry |
-| `/camera/color/image_raw` | `Image` | RGB camera (if CV enabled) |
-| `/camera/depth/image_raw` | `Image` | Depth camera (if CV enabled) |
-| `/camera/color/camera_info` | `CameraInfo` | Camera intrinsics (if CV enabled) |
-| `/scan` | `LaserScan` | LiDAR for direct navigation safety |
+| Topic | Type |
+|-------|------|
+| `/map` | `OccupancyGrid` |
+| `/odom` | `Odometry` |
+| `/scan` | `LaserScan` |
 
 ### Services
 
 | Service | Type | Description |
 |---------|------|-------------|
 | `/hazmap/start_coverage` | `Trigger` | Begin autonomous coverage |
-| `/hazmap/stop_coverage` | `Trigger` | Stop coverage and save results |
+| `/hazmap/stop_coverage` | `Trigger` | Stop and save visit log |
 
 ---
 
-## Output & Results
+## Output
 
-When coverage completes (or is stopped), results are saved to a timestamped directory:
-
-```
-~/ros2_ws/results/YYYYMMDD_HHMMSS/
-├── co_heatmap.png                  # CO concentration heatmap
-├── co2_heatmap.png                 # CO₂ concentration heatmap
-├── methane_heatmap.png             # Methane concentration heatmap
-├── o2_heatmap.png                  # O₂ concentration heatmap
-├── detection_pins.png              # Visual detection pin map (if CV enabled)
-├── consolidated_impact.png         # Priority-weighted combined hazard map
-└── coverage_connectivity_graph.png # RCG graph with executed path overlay
-```
-
-### Consolidated Hazard Map
-
-The consolidated map fuses all sensor and detection data:
-
-- Each sensor grid is normalised to [0, 1] and weighted by `1 / priority`
-- Detection data is projected as a Gaussian splash impact grid and weighted by average detection severity
-- The combined map includes danger contour lines at 50%, 70%, and 90% levels
-- Detection pins are overlaid as coloured markers with splash radius circles
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│                     HazMapNode                          │
-│  (hazmap_core/hazmap_node.py)                           │
-│                                                         │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────────┐   │
-│  │ MapManager  │  │ Progressive  │  │     RCG       │   │
-│  │             │  │  Sampler     │  │               │   │
-│  └──────┬───── ┘  └──────┬───────┘  └───────┬───────┘   │
-│         │                │                  │           │
-│  ┌──────┴────────────────┴──────────────────┴───────┐   │
-│  │              WaypointSelector                    │   │
-│  └─────────────────────┬─────────────────────────────┘  │
-│                        │                                │
-│  ┌─────────────────────┴─────────────────────────────┐  │
-│  │     Navigator (Direct + Nav2 Fallback)            │  │
-│  └───────────────────────────────────────────────────┘  │
-│                                                         │
-│  ┌─────────────────────┐  ┌──────────────────────────┐  │
-│  │   SensorManager     │  │   DetectionManager       │  │
-│  │ (pipeline/)         │  │ (pipeline/) [optional]   │  │
-│  │                     │  │                          │  │
-│  │  CO, CO₂, Methane,  │  │  YOLO → Depth → TF2      │  │
-│  │  O₂ simulation      │  │  → Map-frame pins        │  │
-│  └──────────┬──────────┘  └────────────┬─────────────┘  │
-│             │                          │                │
-│             └──────────┬───────────────┘                │
-│                        ▼                                │
-│            ┌───────────────────────┐                    │
-│            │  Consolidated Hazard  │                    │
-│            │     Impact Map        │                    │
-│            └───────────────────────┘                    │
-└─────────────────────────────────────────────────────────┘
-```
-
-1. **MapManager** maintains the SLAM occupancy grid and coverage state.
-2. **ProgressiveSampler** generates frontier samples at the boundary of explored space.
-3. **RCG** organises samples into a navigable graph with lap connectivity.
-4. **WaypointSelector** picks the next target using boustrophedon sweep logic.
-5. **Navigator** executes motion — fast direct control for short edges, Nav2 for longer ones.
-6. **SensorManager** samples simulated environmental sensors at 4 Hz along the trajectory.
-7. **DetectionManager** (optional) runs YOLO on camera frames and tracks 3D detections.
-8. On completion, all data is fused into a consolidated hazard impact map.
-
----
-
+On completion a timestamped CSV is saved to `~/ros2_ws/results/YYYYMMDD_HHMMSS/visit_log.csv` with one row per navigation step: goal position, navigation result, and coverage statistics at arrival.
