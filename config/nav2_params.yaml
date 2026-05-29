@@ -122,8 +122,12 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.20
-      movement_time_allowance: 20.0
+      # Lower bar + shorter timeout: detect a real stall faster (don't wait
+      # 20s of crawling near a wall before recovering). Most slow approaches
+      # still progress ≥0.10 m in 8 s; if they don't, recovery is the right
+      # answer anyway. Cuts 100-168s stall steps to <20s recovery cycles.
+      required_movement_radius: 0.10
+      movement_time_allowance: 8.0
     general_goal_checker:
       stateful: True
       plugin: "nav2_controller::SimpleGoalChecker"
@@ -134,31 +138,36 @@ controller_server:
     # obstacles instead of sampling many trajectories every tick.
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.45            # ↑ from 0.22; sim has no TB3 HW cap
-      lookahead_dist: 0.85                # ↑ scaled with speed (was 0.6)
-      min_lookahead_dist: 0.45            # ↑ was 0.3
-      max_lookahead_dist: 1.30            # ↑ was 0.9
+      # Dialed back from 0.45 (Phase 3) to 0.35 — still 60% faster than the
+      # original 0.22, but with enough margin that the curvature+cost
+      # regulators don't crash into the stall-recovery loop near walls.
+      desired_linear_vel: 0.35
+      lookahead_dist: 0.65                # scaled with new speed
+      min_lookahead_dist: 0.35
+      max_lookahead_dist: 1.00
       lookahead_time: 1.5
       use_velocity_scaled_lookahead_dist: true
       transform_tolerance: 0.3
       use_collision_detection: true
-      max_allowed_time_to_collision_up_to_carrot: 1.0
-      # Slow down on tight curves for smoothness/stability.
+      # 1.0 → 0.7: less aggressive phantom-collision braking; the rover was
+      # slowing nearly to a stop on harmless inflated cells.
+      max_allowed_time_to_collision_up_to_carrot: 0.7
       use_regulated_linear_velocity_scaling: true
-      regulated_linear_scaling_min_radius: 0.9
-      regulated_linear_scaling_min_speed: 0.10
-      # Slow down near obstacles (proportional to cost).
+      # 0.9 → 0.6: only brake on *truly* tight curves. Many w=1.0 grid paths
+      # have ~0.5 m turns that were triggering the brake unnecessarily.
+      regulated_linear_scaling_min_radius: 0.6
+      # 0.10 → 0.18: floor speed up so it never crawls into the
+      # progress-checker stall threshold.
+      regulated_linear_scaling_min_speed: 0.18
       use_cost_regulated_linear_velocity_scaling: true
-      # Rotate in place toward the path when heading error is large, instead of
-      # arcing — important on a differential base in tight coverage corridors.
       use_rotate_to_heading: true
       rotate_to_heading_min_angle: 0.785
-      rotate_to_heading_angular_vel: 2.0  # ↑ was 1.5; faster pivots
-      max_angular_accel: 4.0              # ↑ was 3.0; matches faster cmd
+      rotate_to_heading_angular_vel: 2.0
+      max_angular_accel: 4.0
       allow_reversing: false
       max_robot_pose_search_dist: 10.0
-      # Final-approach behaviour.
-      min_approach_linear_velocity: 0.05
+      # 0.05 → 0.12: don't crawl on the final-approach to the goal.
+      min_approach_linear_velocity: 0.12
       approach_velocity_scaling_dist: 0.6
 
 local_costmap:
@@ -178,7 +187,10 @@ local_costmap:
       plugins: ["voxel_layer", "inflation_layer"]
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
-        cost_scaling_factor: 3.0
+        # 3.0 → 2.0: softer cost gradient near walls so cost-regulated
+        # speed scaling brakes less aggressively. The rover was braking
+        # on every cell touching inflation, even mid-corridor.
+        cost_scaling_factor: 2.0
         # Must match progressive_sampling.safe_dist - robot_radius - tolerance.
         inflation_radius: 0.30
       voxel_layer:
@@ -292,6 +304,11 @@ behavior_server:
     costmap_topic: local_costmap/costmap_raw
     footprint_topic: local_costmap/published_footprint
     cycle_frequency: 10.0
+    # Keep "wait" — the default BT XML calls it as part of the recovery
+    # sequence and removing the plugin would cause action-not-found at
+    # runtime. The bigger wins are upstream (lower speed, tighter progress
+    # checker, softer inflation gradient) so the BT rarely reaches the
+    # recovery branch in the first place.
     behavior_plugins: ["spin", "backup", "drive_on_heading", "assisted_teleop", "wait"]
     spin:
       plugin: "nav2_behaviors/Spin"
@@ -307,8 +324,9 @@ behavior_server:
     robot_base_frame: base_link
     transform_tolerance: 0.1
     use_sim_time: true
-    simulate_ahead_time: 2.0
-    max_rotational_vel: 1.0
+    simulate_ahead_time: 1.0              # was 2.0 — less time predicting
+    max_rotational_vel: 2.0               # was 1.0 — match controller setpoint;
+                                          # faster spin-recoveries when they fire
     min_rotational_vel: 0.4
     rotational_acc_lim: 3.2
 
@@ -334,8 +352,8 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.45, 0.0, 2.0]      # ↑ linear+angular; sim has no HW cap
-    min_velocity: [-0.45, 0.0, -2.0]
+    max_velocity: [0.35, 0.0, 2.0]      # match FollowPath.desired_linear_vel
+    min_velocity: [-0.35, 0.0, -2.0]
     max_accel: [3.0, 0.0, 4.0]
     max_decel: [-3.0, 0.0, -4.0]
     odom_topic: "odom"

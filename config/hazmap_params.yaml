@@ -22,8 +22,11 @@ hazmap_node:
     use_hybrid_navigation: true
     direct_nav_same_lap_only: false     
     direct_nav_max_distance: 0.70       # max edge length for direct mode
-    direct_nav_linear_speed: 0.40       # ↑ from 0.20 — short-hop top speed
-    direct_nav_angular_speed: 1.80      # ↑ from 1.00 — snappier turning
+    direct_nav_linear_speed: 0.30       # Phase 5: dialed back to match
+                                        # Nav2's stall-fix velocity (0.35)
+                                        # so short hops don't outrun the
+                                        # controller's safety margins.
+    direct_nav_angular_speed: 1.80      # snappier turning unchanged
     direct_nav_xy_tolerance: 0.08       # arrival tolerance (m)
     direct_nav_yaw_tolerance: 0.30      # heading tolerance before moving (rad)
     direct_nav_timeout: 20.0            # seconds
