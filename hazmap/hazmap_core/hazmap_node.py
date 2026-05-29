@@ -96,6 +96,13 @@ class HazMapNode(Node):
         # candidates that would force a long Nav2 detour (the step-18 "0.85m
         # goal that's actually 10m around the wall" pattern). 1.0 = disabled.
         self.declare_parameter('path_blocked_penalty', 3.0)
+        # Phase-7 per-step Nav2 timeout. Caps how long a single Nav2 goal
+        # may run before we give up and let the failure path (backup + retry,
+        # then close as unreachable after MAX_NODE_FAILS) take over. The
+        # 206 s step-40 stall last sprint was Nav2 saturating its 20Hz
+        # controller and burning the default 120 s timeout twice (2×120≈240).
+        # Default 50 s caps worst case at ~100 s before the node is dropped.
+        self.declare_parameter('nav_step_timeout_s', 50.0)
         # If the same OPEN node is selected this many times in a row without
         # the rover physically getting within rc of it, force-close it so
         # the run can't livelock on an unreachable target (e.g. the corner
@@ -215,6 +222,9 @@ class HazMapNode(Node):
         )
         self.path_blocked_penalty = float(
             self.get_parameter('path_blocked_penalty').value
+        )
+        self.nav_step_timeout_s = float(
+            self.get_parameter('nav_step_timeout_s').value
         )
         self.stuck_node_patience = int(
             self.get_parameter('stuck_node_patience').value
@@ -734,7 +744,10 @@ class HazMapNode(Node):
                     'cstar', target.x, target.y, node_id=next_id,
                 )
 
-                success = self.navigator.go_to(target.x, target.y, prefer_direct=False)
+                success = self.navigator.go_to(
+                    target.x, target.y, prefer_direct=False,
+                    timeout=self.nav_step_timeout_s,
+                )
                 self._mark_visit_result(
                     visit_idx, 'arrived' if success else 'nav_failed',
                 )
@@ -959,6 +972,7 @@ class HazMapNode(Node):
                         else:
                             success = self.navigator.go_to(
                                 nearest_open.x, nearest_open.y, prefer_direct=False,
+                                timeout=self.nav_step_timeout_s,
                             )
                             if success:
                                 self.current_node_id = nearest_open.id
