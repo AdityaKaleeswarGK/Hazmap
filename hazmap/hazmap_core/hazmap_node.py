@@ -95,6 +95,13 @@ class HazMapNode(Node):
         # the run can't livelock on an unreachable target (e.g. the corner
         # node that sits 0.02 m outside reach inside an inflated wall).
         self.declare_parameter('stuck_node_patience', 3)
+        # ── Phase 2: en-route node closing ───────────────────────────────
+        # After each traverse, CLOSE OPEN nodes the rover physically drove
+        # over (within enroute_close_radius of the path segment) and that are
+        # now covered — so it never deliberately drives back to a node it
+        # already covered in transit. Frontier nodes are kept.
+        self.declare_parameter('enroute_close_enable', True)
+        self.declare_parameter('enroute_close_radius', 0.40)
         # ── Next-Best-View (coverage_mode: 'nbv') ────────────────────────
         self.declare_parameter('sensor_range', 0.0)          # 0 → fall back to rd
         self.declare_parameter('sensor_fov_deg', 360.0)
@@ -174,6 +181,12 @@ class HazMapNode(Node):
         )
         self.stuck_node_patience = int(
             self.get_parameter('stuck_node_patience').value
+        )
+        self.enroute_close_enable = self.get_parameter(
+            'enroute_close_enable'
+        ).value
+        self.enroute_close_radius = float(
+            self.get_parameter('enroute_close_radius').value
         )
         _sensor_range = self.get_parameter('sensor_range').value
         self.sensor_range = _sensor_range if _sensor_range > 0.0 else self.rd
@@ -673,11 +686,30 @@ class HazMapNode(Node):
                 arrived = self.rcg.nodes[self.current_node_id]
                 self._add_pose(arrived.x, arrived.y)
 
-                # Mark coverage swath
+                # Mark coverage swath. Capture the segment we just traversed
+                # BEFORE _mark_covered_to advances the anchor, so we can also
+                # close OPEN nodes the rover physically drove past en route —
+                # not just those near the arrival pose. This stops the rover
+                # from later "re-visiting" a node it already covered in transit
+                # (the node-92-twice pattern at the end of the last sprint).
+                seg_x0, seg_y0 = (
+                    self._coverage_anchor
+                    if self._coverage_anchor is not None
+                    else (arrived.x, arrived.y)
+                )
                 self._mark_covered_to(arrived.x, arrived.y)
 
                 rx, ry = self._robot_x, self._robot_y
                 self.rcg.close_nearby_nodes(rx, ry, self.rc)
+                if self.enroute_close_enable:
+                    n_enroute = self._close_nodes_along_path(
+                        seg_x0, seg_y0, arrived.x, arrived.y
+                    )
+                    if n_enroute and self.debug:
+                        self.get_logger().info(
+                            f'  En-route: closed {n_enroute} OPEN nodes the '
+                            f'rover passed over in transit.'
+                        )
                 self.goal_selector.update_retreat_nodes(rx, ry)
 
                 # Incremental sampling + RCG expansion (Algorithm 4 lines 3-7)
@@ -1715,6 +1747,55 @@ class HazMapNode(Node):
                 self.rcg.set_node_state(nid, NodeState.CLOSED)
                 pruned += 1
         return pruned
+
+    @staticmethod
+    def _point_segment_distance(px, py, x0, y0, x1, y1) -> float:
+        """Shortest distance from point (px,py) to segment (x0,y0)-(x1,y1)."""
+        dx, dy = x1 - x0, y1 - y0
+        seg_len_sq = dx * dx + dy * dy
+        if seg_len_sq <= 1e-9:
+            return math.hypot(px - x0, py - y0)
+        t = ((px - x0) * dx + (py - y0) * dy) / seg_len_sq
+        t = max(0.0, min(1.0, t))
+        cx, cy = x0 + t * dx, y0 + t * dy
+        return math.hypot(px - cx, py - cy)
+
+    def _close_nodes_along_path(self, x0, y0, x1, y1) -> int:
+        """Close OPEN nodes whose position lies within the coverage swath of
+        the segment the rover just traversed — i.e. nodes it physically drove
+        over. These were already covered in transit, so deliberately driving
+        back to them later is pure overlap. Frontier nodes (adjacent to
+        unknown) are kept so genuine exploration targets survive.
+
+        Returns the count of nodes closed.
+        """
+        if not self.ogm.ready:
+            return 0
+        radius = self.enroute_close_radius
+        closed = 0
+        for nid in list(self.rcg._open_ids):
+            node = self.rcg.nodes.get(nid)
+            if node is None or nid == self.current_node_id:
+                continue
+            d = self._point_segment_distance(node.x, node.y, x0, y0, x1, y1)
+            if d > radius:
+                continue
+            # Keep frontier nodes: bordering unknown means there may still be
+            # area to *discover* there even if we drove past the free side.
+            if self.prune_keep_frontier and self.ogm.is_adjacent_to_unknown(
+                node.x, node.y, self.w
+            ):
+                continue
+            # Only close if it's actually covered now (gain ~0) — guards
+            # against closing a node that sits near the path but still fronts
+            # a genuinely uncovered pocket the straight-segment swath missed.
+            gain = self.ogm.predict_coverage_gain(
+                node.x, node.y, max(self.rc, 0.5 * self.w)
+            )
+            if gain < self.prune_gain_min_cells:
+                self.rcg.set_node_state(nid, NodeState.CLOSED)
+                closed += 1
+        return closed
 
     def _refine_known_map_coverage(self):
         """

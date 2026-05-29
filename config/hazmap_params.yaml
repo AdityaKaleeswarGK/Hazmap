@@ -58,6 +58,16 @@ hazmap_node:
     # (the "node 111 at (-3.64,-3.88) infinite-loop" bug at end of run).
     stuck_node_patience: 3
 
+    # ── Phase 2: en-route node closing ───────────────────────────────────
+    # After each traverse, close OPEN nodes the rover physically drove over
+    # (within enroute_close_radius of the straight path segment) and that are
+    # now covered — so it never drives back to "visit" a node it already
+    # covered in transit (the node-92-visited-twice pattern). Frontier nodes
+    # (adjacent to unknown) are kept. radius ≈ coverage swath (rc=0.375) plus
+    # a small margin for the curved actual path vs the straight segment.
+    enroute_close_enable: true
+    enroute_close_radius: 0.40
+
     # ── Next-Best-View mode (set coverage_mode: "nbv") ──────────────────
     # Surveillance / gas-mapping style coverage: the rover drives to the
     # viewpoint that *reveals* the most still-unseen area, crediting cells
