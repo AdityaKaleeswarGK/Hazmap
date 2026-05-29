@@ -35,6 +35,8 @@ class ProgressiveSampler:
         sweep_dir: Tuple[float, float],
         ogm: OccupancyGridManager,
         known_map_mode: bool = False,
+        density_keep_floor: float = 1.0,
+        density_open_distance: float = 1.5,
     ):
         """
         Parameters
@@ -42,14 +44,22 @@ class ProgressiveSampler:
         w  : sampling resolution (inter-lap distance, metres)
         rd : detection / scanning radius for the sampling front
         sweep_dir : (dx, dy) unit vector perpendicular to laps
-                    (laps run along sweep_dir, lap shifting is
-                     perpendicular to it)
         ogm : shared OccupancyGridManager
+        density_keep_floor : in open regions (far from any obstacle), keep
+            only this fraction of lap samples. 1.0 = uniform sampling
+            (legacy). 0.4 = drop 60% of open-area nodes — fewer redundant
+            visits in empty space, matching the surveillance-not-coverage
+            framing. Cluttered/feature-rich regions stay densely sampled.
+        density_open_distance : a sample is "in open space" if the nearest
+            obstacle is this far or further (metres). Default 1.5.
         """
         self.w = w
         self.rd = rd
         self.ogm = ogm
         self.known_map_mode = known_map_mode
+        self.density_keep_floor = max(0.0, min(1.0, density_keep_floor))
+        self.density_open_distance = density_open_distance
+        self._rng = np.random.default_rng(0)
         # Sweep direction (unit vector) – laps extend along this direction
         mag = math.hypot(sweep_dir[0], sweep_dir[1]) or 1.0
         self.sweep_dx = sweep_dir[0] / mag
@@ -173,6 +183,19 @@ class ProgressiveSampler:
 
                     if not shifted:
                         continue  # Even dragged back 0.40m it's lethal, discard this sample
+
+                # Density-modulated keep (surveillance framing): drop most
+                # samples in open empty space, keep all in cluttered /
+                # feature-rich regions. Uses nearest_obstacle_distance as
+                # the complexity proxy — far from any wall → "open". Mark
+                # the cell sampled either way so we don't reroll the same
+                # bucket (avoids stalling on a string of unlucky rejects).
+                if self.density_keep_floor < 1.0:
+                    d_obs = self.ogm.nearest_obstacle_distance(sx, sy)
+                    if d_obs >= self.density_open_distance:
+                        if self._rng.random() > self.density_keep_floor:
+                            self._sampled_cells.add(cell_key)
+                            continue
 
                 # Determine if this is an end node (at the end of a lap)
                 is_end = self._is_lap_end(sx, sy)

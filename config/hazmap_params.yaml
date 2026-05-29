@@ -5,7 +5,13 @@ hazmap_node:
                             # observation). Sampler's obstacle-adjacency filter
                             # still places nodes in tight regions, so this
                             # mostly trims redundant open-space laps.
-    rc: 0.375               # coverage radius per waypoint (≈ w/2)
+    rc: 0.500               # coverage radius per waypoint — ↑ from 0.375 to
+                            # match w/2 (=0.5 with w=1.0). Previously rc<w/2
+                            # left a 0.25 m uncovered gap between adjacent
+                            # laps; nodes in those gaps still reported gain
+                            # so the selector kept targeting them as
+                            # "uncovered" even though practically observed.
+                            # Wider swath = single-pass-covers-a-lap-stripe.
     rd: 3.0                 # detection/sampling lookahead radius
     delta: 1                # kept for compat (unused by C* sampler)
     sweep_direction: "x"    # "x" = vertical laps, "y" = horizontal laps
@@ -75,7 +81,17 @@ hazmap_node:
     # (adjacent to unknown) are kept. radius ≈ coverage swath (rc=0.375) plus
     # a small margin for the curved actual path vs the straight segment.
     enroute_close_enable: true
-    enroute_close_radius: 0.40
+    enroute_close_radius: 0.55     # ↑ from 0.40, proportional to rc bump
+
+    # ── Phase 4: adaptive frontier density (surveillance framing) ────────
+    # In open empty regions (>= density_open_distance from any obstacle),
+    # keep only density_keep_floor fraction of lap samples. Cluttered /
+    # feature-rich regions stay densely sampled — your "denser frontiers in
+    # cluttered regions, sparser in open" framing. Surveillance doesn't
+    # need exhaustive coverage of empty rooms; this removes scattered
+    # open-area nodes that the selector wastes time targeting.
+    density_keep_floor: 0.40       # 1.0 = uniform (legacy); 0.0 = strip all open
+    density_open_distance: 1.5     # m from nearest obstacle to count as "open"
 
     # ── Unreachable-node pruning ─────────────────────────────────────────
     # Close OPEN nodes lodged inside the costmap inflation (closer than

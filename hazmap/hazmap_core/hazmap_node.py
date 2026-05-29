@@ -106,7 +106,15 @@ class HazMapNode(Node):
         # now covered — so it never deliberately drives back to a node it
         # already covered in transit. Frontier nodes are kept.
         self.declare_parameter('enroute_close_enable', True)
-        self.declare_parameter('enroute_close_radius', 0.40)
+        self.declare_parameter('enroute_close_radius', 0.55)
+        # ── Phase 4: adaptive frontier density (surveillance framing) ────
+        # In open empty regions (>= density_open_distance from any obstacle),
+        # keep only density_keep_floor fraction of lap samples. Cluttered /
+        # feature-rich regions stay densely sampled. Set keep_floor=1.0 to
+        # disable. The selector then has FEWER scattered open-area targets
+        # to chase, killing the residual long jumps to sparse open nodes.
+        self.declare_parameter('density_keep_floor', 0.40)
+        self.declare_parameter('density_open_distance', 1.5)
         # ── Unreachable-node pruning ─────────────────────────────────────
         # Close OPEN nodes lodged inside the costmap inflation (too close to
         # an obstacle for the rover to ever reach). These never close on
@@ -211,6 +219,12 @@ class HazMapNode(Node):
         self.enroute_close_radius = float(
             self.get_parameter('enroute_close_radius').value
         )
+        self.density_keep_floor = float(
+            self.get_parameter('density_keep_floor').value
+        )
+        self.density_open_distance = float(
+            self.get_parameter('density_open_distance').value
+        )
         self.unreachable_prune_enable = self.get_parameter(
             'unreachable_prune_enable'
         ).value
@@ -253,6 +267,8 @@ class HazMapNode(Node):
             sweep_dir,
             self.ogm,
             known_map_mode=self.known_map_mode,
+            density_keep_floor=self.density_keep_floor,
+            density_open_distance=self.density_open_distance,
         )
         self.rcg = RCG(self.w, self.ogm)
         self.goal_selector = GoalSelector(
