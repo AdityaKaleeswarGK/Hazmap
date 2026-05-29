@@ -18,7 +18,6 @@ from .occupancy_grid_manager import OccupancyGridManager
 from .progressive_sampling import ProgressiveSampler
 from .rcg import RCG, NodeState
 from .goal_selection import GoalSelector
-from .tsp_solver import TSPSolver, TSPPlan
 from .navigator import Navigator
 from .spiral_stc import SpiralSTCPlanner
 from .boustrophedon import BoustrophedonPlanner
@@ -295,7 +294,6 @@ class HazMapNode(Node):
             commit_threshold=self.commit_threshold,
             path_blocked_penalty=self.path_blocked_penalty,
         )
-        self.tsp_solver = TSPSolver(self.rcg)
         self.stc_planner = SpiralSTCPlanner(self.ogm, cell_size_m=self.stc_cell_size)
         self.boustro_planner = BoustrophedonPlanner(
             self.ogm,
@@ -731,8 +729,6 @@ class HazMapNode(Node):
                 if next_id not in self.rcg.nodes:
                     self.get_logger().warn(f'Node {next_id} missing!')
                     break
-
-                self._detect_and_cover_holes(self.current_node_id, next_id)
 
                 target = self.rcg.nodes[next_id]
                 self.get_logger().info(
@@ -1565,48 +1561,6 @@ class HazMapNode(Node):
         msg.info.origin.orientation.w = 1.0
         msg.data = grid.flatten().tolist()
         self.obs_quality_pub.publish(msg)
-
-    # ------------------------------------------------------------------
-    # Coverage hole detection (uses C* TSPSolver)
-    # ------------------------------------------------------------------
-    def _detect_and_cover_holes(self, current_id: int, next_id: int):
-        if current_id not in self.rcg.nodes:
-            return
-
-        holes = self.tsp_solver.detect_coverage_holes(current_id, next_id)
-        if not holes:
-            return
-
-        all_hole_nodes = set()
-        for h in holes:
-            all_hole_nodes.update(h)
-
-        self.get_logger().info(
-            f'  Detected {len(holes)} coverage hole(s), '
-            f'{len(all_hole_nodes)} total nodes — TSP (Alg 3) …'
-        )
-
-        plan = self.tsp_solver.compute_tsp_plan(all_hole_nodes, current_id, next_id)
-        if plan is None:
-            return
-
-        for wp in plan.waypoints:
-            if not self.coverage_running:
-                break
-            success = self.navigator.go_to(wp.x, wp.y, prefer_direct=False)
-            if success:
-                self._mark_covered_to(wp.x, wp.y)
-                rx, ry = self._robot_x, self._robot_y
-                self.rcg.close_nearby_nodes(rx, ry, self.rc)
-                self.goal_selector.update_retreat_nodes(rx, ry)
-                if wp.node_id is not None and wp.node_id in self.rcg.nodes:
-                    self.rcg.set_node_state(wp.node_id, NodeState.CLOSED)
-                    self.current_node_id = wp.node_id
-                    self._add_pose(wp.x, wp.y)
-            else:
-                self.get_logger().warn(
-                    f'  TSP: failed to reach ({wp.x:.2f},{wp.y:.2f}), skipping.'
-                )
 
     # ------------------------------------------------------------------
     # Graph-path navigation
