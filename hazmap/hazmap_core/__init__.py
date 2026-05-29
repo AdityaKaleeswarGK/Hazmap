@@ -3,9 +3,6 @@ from .progressive_sampling import ProgressiveSampler
 from .rcg import NodeState, RCGNode, RCG
 from .navigator import Navigator
 from .goal_selection import GoalSelector
-from .spiral_stc import SpiralSTCPlanner
-from .boustrophedon import BoustrophedonPlanner
-from .next_best_view import NextBestViewSelector
 
 __all__ = [
     'OccupancyGridManager',
@@ -15,7 +12,4 @@ __all__ = [
     'RCG',
     'Navigator',
     'GoalSelector',
-    'SpiralSTCPlanner',
-    'BoustrophedonPlanner',
-    'NextBestViewSelector',
 ]

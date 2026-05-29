@@ -19,9 +19,6 @@ from .progressive_sampling import ProgressiveSampler
 from .rcg import RCG, NodeState
 from .goal_selection import GoalSelector
 from .navigator import Navigator
-from .spiral_stc import SpiralSTCPlanner
-from .boustrophedon import BoustrophedonPlanner
-from .next_best_view import NextBestViewSelector
 
 
 class HazMapNode(Node):
@@ -51,27 +48,11 @@ class HazMapNode(Node):
         self.declare_parameter('direct_nav_timeout', 20.0)
         self.declare_parameter('direct_nav_fallback_to_nav2', True)
         self.declare_parameter('direct_nav_min_clearance', 0.20)
-        self.declare_parameter('known_map_mode', False)
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('cmd_vel_topic', '/cmd_vel')
         self.declare_parameter('auto_start_coverage', False)
-        self.declare_parameter('coverage_mode', 'cstar')
-        self.declare_parameter('stc_cell_size', 0.5)
-        self.declare_parameter('lawnmower_spacing', 0.70)
-        self.declare_parameter('lawnmower_boundary_margin', 0.70)
-        self.declare_parameter('lawnmower_waypoint_retries', 3)
-        self.declare_parameter('lawnmower_max_consecutive_failures', 6)
-        self.declare_parameter('lawnmower_min_completion_ratio', 0.90)
-        self.declare_parameter('coverage_target_percent', 95.0)
-        self.declare_parameter('coverage_refine_max_goals', 120)
-        self.declare_parameter('coverage_refine_max_nav_failures', 12)
-        self.declare_parameter('coverage_refine_total_failures_limit', 20)
-        self.declare_parameter('coverage_refine_timeout_sec', 300.0)
-        self.declare_parameter('coverage_refine_search_range', 100.0)
-        self.declare_parameter('coverage_refine_no_gain_patience', 10)
-        self.declare_parameter('coverage_refine_min_gain_percent', 0.20)
         # ── Coverage-saturation pruning (shift from node-exhaustion) ─────
         # Periodically CLOSE OPEN nodes that sit in already-covered, fully
         # known space (low coverage gain AND not bordering unknown). This
@@ -142,16 +123,6 @@ class HazMapNode(Node):
         self.declare_parameter('eff_window_size', 6)
         self.declare_parameter('eff_stop_threshold', 0.12)   # m² per metre
         self.declare_parameter('eff_stop_min_coverage', 80.0)  # percent
-        # ── Next-Best-View (coverage_mode: 'nbv') ────────────────────────
-        self.declare_parameter('sensor_range', 0.0)          # 0 → fall back to rd
-        self.declare_parameter('sensor_fov_deg', 360.0)
-        self.declare_parameter('nbv_n_rays', 72)
-        self.declare_parameter('nbv_q_min', 0.4)             # quality → "observed"
-        self.declare_parameter('nbv_target_percent', 90.0)   # observed-coverage goal
-        self.declare_parameter('nbv_cost_weight', 1.0)       # travel-cost exponent
-        self.declare_parameter('nbv_max_candidates', 40)
-        self.declare_parameter('nbv_min_gain', 1.0)          # quality units to bother
-        self.declare_parameter('nbv_no_gain_patience', 8)
 
         self.w = self.get_parameter('w').value
         self.rc = self.get_parameter('rc').value
@@ -169,47 +140,11 @@ class HazMapNode(Node):
         self.direct_nav_timeout = self.get_parameter('direct_nav_timeout').value
         self.direct_nav_fallback_to_nav2 = self.get_parameter('direct_nav_fallback_to_nav2').value
         self.direct_nav_min_clearance = self.get_parameter('direct_nav_min_clearance').value
-        self.known_map_mode = self.get_parameter('known_map_mode').value
         self.map_topic = self.get_parameter('map_topic').value
         self.odom_topic = self.get_parameter('odom_topic').value
         self.scan_topic = self.get_parameter('scan_topic').value
         self.cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
         self.auto_start_coverage = self.get_parameter('auto_start_coverage').value
-        self.coverage_mode = self.get_parameter('coverage_mode').value
-        self.stc_cell_size = self.get_parameter('stc_cell_size').value
-        self.lawnmower_spacing = self.get_parameter('lawnmower_spacing').value
-        self.lawnmower_boundary_margin = self.get_parameter('lawnmower_boundary_margin').value
-        self.lawnmower_waypoint_retries = self.get_parameter('lawnmower_waypoint_retries').value
-        self.lawnmower_max_consecutive_failures = self.get_parameter(
-            'lawnmower_max_consecutive_failures'
-        ).value
-        self.lawnmower_min_completion_ratio = self.get_parameter(
-            'lawnmower_min_completion_ratio'
-        ).value
-        self.coverage_target_percent = self.get_parameter(
-            'coverage_target_percent'
-        ).value
-        self.coverage_refine_max_goals = self.get_parameter(
-            'coverage_refine_max_goals'
-        ).value
-        self.coverage_refine_max_nav_failures = self.get_parameter(
-            'coverage_refine_max_nav_failures'
-        ).value
-        self.coverage_refine_total_failures_limit = self.get_parameter(
-            'coverage_refine_total_failures_limit'
-        ).value
-        self.coverage_refine_timeout_sec = self.get_parameter(
-            'coverage_refine_timeout_sec'
-        ).value
-        self.coverage_refine_search_range = self.get_parameter(
-            'coverage_refine_search_range'
-        ).value
-        self.coverage_refine_no_gain_patience = self.get_parameter(
-            'coverage_refine_no_gain_patience'
-        ).value
-        self.coverage_refine_min_gain_percent = self.get_parameter(
-            'coverage_refine_min_gain_percent'
-        ).value
         self.prune_enable = self.get_parameter('prune_enable').value
         self.prune_interval = max(1, int(self.get_parameter('prune_interval').value))
         self.prune_gain_min_cells = int(
@@ -259,16 +194,6 @@ class HazMapNode(Node):
         self.eff_stop_min_coverage = float(
             self.get_parameter('eff_stop_min_coverage').value
         )
-        _sensor_range = self.get_parameter('sensor_range').value
-        self.sensor_range = _sensor_range if _sensor_range > 0.0 else self.rd
-        self.sensor_fov_deg = self.get_parameter('sensor_fov_deg').value
-        self.nbv_n_rays = self.get_parameter('nbv_n_rays').value
-        self.nbv_q_min = self.get_parameter('nbv_q_min').value
-        self.nbv_target_percent = self.get_parameter('nbv_target_percent').value
-        self.nbv_cost_weight = self.get_parameter('nbv_cost_weight').value
-        self.nbv_max_candidates = self.get_parameter('nbv_max_candidates').value
-        self.nbv_min_gain = self.get_parameter('nbv_min_gain').value
-        self.nbv_no_gain_patience = self.get_parameter('nbv_no_gain_patience').value
 
         # ── C* core algorithm objects ────────────────────────────────
         self.ogm = OccupancyGridManager(free_threshold=50)
@@ -284,7 +209,7 @@ class HazMapNode(Node):
             self.rd,
             sweep_dir,
             self.ogm,
-            known_map_mode=self.known_map_mode,
+            known_map_mode=False,
             density_keep_floor=self.density_keep_floor,
             density_open_distance=self.density_open_distance,
         )
@@ -293,22 +218,6 @@ class HazMapNode(Node):
             self.rcg, ogm=self.ogm, rc=self.rc,
             commit_threshold=self.commit_threshold,
             path_blocked_penalty=self.path_blocked_penalty,
-        )
-        self.stc_planner = SpiralSTCPlanner(self.ogm, cell_size_m=self.stc_cell_size)
-        self.boustro_planner = BoustrophedonPlanner(
-            self.ogm,
-            lap_spacing_m=self.lawnmower_spacing,
-            boundary_margin_m=self.lawnmower_boundary_margin,
-        )
-        self.nbv_selector = NextBestViewSelector(
-            self.rcg,
-            self.ogm,
-            sensor_range=self.sensor_range,
-            fov_deg=self.sensor_fov_deg,
-            n_rays=int(self.nbv_n_rays),
-            q_min=self.nbv_q_min,
-            cost_weight=self.nbv_cost_weight,
-            max_candidates=int(self.nbv_max_candidates),
         )
         self.navigator = None  # initialised in run_coverage
         self._coverage_anchor = None
@@ -381,8 +290,7 @@ class HazMapNode(Node):
 
         self.get_logger().info(
             f'HazMap node ready (C* core): w={self.w}m, rc={self.rc}m, '
-            f'rd={self.rd}m, sweep={self.sweep_direction}, '
-            f'known_map_mode={self.known_map_mode}, coverage_mode={self.coverage_mode}'
+            f'rd={self.rd}m, sweep={self.sweep_direction}'
         )
 
         if self.auto_start_coverage:
@@ -476,16 +384,6 @@ class HazMapNode(Node):
     # Main coverage loop
     # ------------------------------------------------------------------
     def run_coverage(self):
-        if self.coverage_mode == 'boustrophedon_known':
-            self.run_coverage_boustrophedon()
-            return
-        if self.coverage_mode == 'spiral_stc_known':
-            self.run_coverage_spiral_stc()
-            return
-        if self.coverage_mode == 'nbv':
-            self.run_coverage_nbv()
-            return
-
         """HazMap coverage algorithm using C* core — runs in a dedicated thread."""
         self.coverage_running = True
         self.get_logger().info('═══ HAZMAP COVERAGE STARTING (C* core) ═══')
@@ -524,10 +422,7 @@ class HazMapNode(Node):
         robot_x, robot_y = self._robot_x, self._robot_y
         self.get_logger().info(f'Robot start: ({robot_x:.2f}, {robot_y:.2f})')
 
-        if not self.known_map_mode:
-            self.get_logger().info('Initial 360° rotation for SLAM discovery skipped.')
-        else:
-            self.get_logger().info('Known-map mode: skipping initial SLAM discovery spin.')
+        self.get_logger().info('Initial 360° rotation for SLAM discovery skipped.')
 
         robot_x, robot_y = self._robot_x, self._robot_y
         new_samples = self.sampler.generate_samples(robot_x, robot_y)
@@ -577,9 +472,8 @@ class HazMapNode(Node):
         region_inject_counter = 0
         REGION_INJECT_INTERVAL = 12
 
-        # Configurable early termination: stop when coverage_target_percent
-        # is reached even in unknown-map mode. Set to >100 to disable.
-        early_stop_coverage = float(self.coverage_target_percent)
+        # Early termination: stop when coverage reaches this %. Set >100 to disable.
+        early_stop_coverage = 95.0
 
         # Stagnation detector: in unknown-map mode the "coverage %" has a
         # moving denominator (new free cells appear as the rover discovers
@@ -926,14 +820,9 @@ class HazMapNode(Node):
             if not self.coverage_running:
                 break
 
-            if not self.known_map_mode:
-                self.get_logger().info(
-                    'Inner loop done — 360° rotation for SLAM discovery skipped.'
-                )
-            else:
-                self.get_logger().info(
-                    'Inner loop done — known-map mode, no SLAM spin needed.'
-                )
+            self.get_logger().info(
+                'Inner loop done — 360° rotation for SLAM discovery skipped.'
+            )
 
             self.get_logger().info('Checking for new sampling front …')
             rx, ry = self._robot_x, self._robot_y
@@ -1083,488 +972,6 @@ class HazMapNode(Node):
         self._save_visit_log()
         self.coverage_running = False
 
-    def run_coverage_spiral_stc(self):
-        """Known-map coverage using Spiral-STC style tree traversal."""
-        self.coverage_running = True
-        self.coverage_complete = False
-        self.initialized = True
-        self.get_logger().info('═══ HAZMAP COVERAGE STARTING (Spiral-STC known map) ═══')
-
-        self.get_logger().info('Waiting for /map …')
-        t0 = time.time()
-        while not self.ogm.ready:
-            if time.time() - t0 > 30.0:
-                self.get_logger().error('Timeout waiting for /map!')
-                self.coverage_running = False
-                return
-            time.sleep(0.5)
-
-        self.navigator = Navigator(
-            self,
-            pose_provider=self._get_robot_pose,
-            safety_check=self._direct_safety_check,
-            direct_enabled=self.use_hybrid_navigation,
-            direct_linear_speed=self.direct_nav_linear_speed,
-            direct_angular_speed=self.direct_nav_angular_speed,
-            direct_xy_tolerance=self.direct_nav_xy_tolerance,
-            direct_yaw_tolerance=self.direct_nav_yaw_tolerance,
-            direct_timeout=self.direct_nav_timeout,
-            direct_fallback_to_nav2=self.direct_nav_fallback_to_nav2,
-            scan_topic=self.scan_topic,
-            cmd_vel_topic=self.cmd_vel_topic,
-        )
-        if not self.navigator.is_server_ready():
-            self.get_logger().error('Nav2 action server not ready!')
-            self.coverage_running = False
-            return
-
-        rx, ry = self._robot_x, self._robot_y
-        self._add_pose(rx, ry)
-        self._reset_coverage_anchor(rx, ry)
-        self.get_logger().info(
-            f'Planning Spiral-STC route from ({rx:.2f}, {ry:.2f}), '
-            f'cell_size={self.stc_cell_size:.2f}m'
-        )
-        waypoints = self.stc_planner.plan(rx, ry)
-        if not waypoints:
-            self.get_logger().warn(
-                'Spiral-STC planner returned no waypoints. '
-                'Falling back to C* coverage in known-map mode.'
-            )
-            self.coverage_running = False
-            self.coverage_mode = 'cstar'
-            self.run_coverage()
-            return
-
-        self.get_logger().info(f'Spiral-STC route size: {len(waypoints)} waypoints')
-        # Fast path: drive the route in NavigateThroughPoses chunks; resume
-        # per-waypoint from the first chunk that fails.
-        resume = self._drive_route_ntp(waypoints)
-        if resume:
-            self.get_logger().info(
-                f'Spiral-STC: NTP completed {resume}/{len(waypoints)} waypoints.'
-            )
-        for i, (tx, ty) in enumerate(waypoints[resume:], start=resume + 1):
-            if not self.coverage_running:
-                break
-            rx, ry, _ = self._get_robot_pose()
-            if math.hypot(tx - rx, ty - ry) < max(0.10, self.direct_nav_xy_tolerance):
-                # Skip ultra-short hops that can trigger controller churn.
-                self._mark_covered_to(tx, ty)
-                continue
-            self._publish_goal(tx, ty)
-            ok = self.navigator.go_to(tx, ty, prefer_direct=True, timeout=90.0)
-            if not ok:
-                self.navigator.backup(distance=0.20, speed=0.08, rotate_angle=0.35)
-                ok = self.navigator.go_to(tx, ty, prefer_direct=True, timeout=90.0)
-            if not ok:
-                self.get_logger().warn(
-                    f'Spiral-STC: nav failed at {i}/{len(waypoints)} '
-                    f'({tx:.2f},{ty:.2f}), continuing.'
-                )
-                continue
-            self._add_pose(tx, ty)
-            self._mark_covered_to(tx, ty)
-
-        if not self.coverage_running:
-            self.coverage_complete = False
-            self.get_logger().warn('Spiral-STC coverage interrupted before completion.')
-        else:
-            coverage_percent = self._refine_known_map_coverage()
-            self.coverage_complete = coverage_percent >= float(self.coverage_target_percent)
-            if self.coverage_complete:
-                self.get_logger().info(
-                    'Spiral-STC coverage completed. '
-                    f'area={coverage_percent:.1f}% '
-                    f'(target {float(self.coverage_target_percent):.1f}%).'
-                )
-            else:
-                self.get_logger().warn(
-                    'Spiral-STC coverage ended below area target. '
-                    f'area={coverage_percent:.1f}%, '
-                    f'target={float(self.coverage_target_percent):.1f}%.'
-                )
-        self.coverage_running = False
-        self._save_visit_log()
-
-    def run_coverage_boustrophedon(self):
-        """Known-map coverage using boustrophedon lawnmower strips."""
-        self.coverage_running = True
-        self.coverage_complete = False
-        self.initialized = True
-        self.get_logger().info('═══ HAZMAP COVERAGE STARTING (Boustrophedon known map) ═══')
-
-        self.get_logger().info('Waiting for /map …')
-        t0 = time.time()
-        while not self.ogm.ready:
-            if time.time() - t0 > 30.0:
-                self.get_logger().error('Timeout waiting for /map!')
-                self.coverage_running = False
-                return
-            time.sleep(0.5)
-
-        self.navigator = Navigator(
-            self,
-            pose_provider=self._get_robot_pose,
-            safety_check=self._direct_safety_check,
-            direct_enabled=self.use_hybrid_navigation,
-            direct_linear_speed=self.direct_nav_linear_speed,
-            direct_angular_speed=self.direct_nav_angular_speed,
-            direct_xy_tolerance=self.direct_nav_xy_tolerance,
-            direct_yaw_tolerance=self.direct_nav_yaw_tolerance,
-            direct_timeout=self.direct_nav_timeout,
-            direct_fallback_to_nav2=self.direct_nav_fallback_to_nav2,
-            scan_topic=self.scan_topic,
-            cmd_vel_topic=self.cmd_vel_topic,
-        )
-        if not self.navigator.is_server_ready():
-            self.get_logger().error('Nav2 action server not ready!')
-            self.coverage_running = False
-            return
-
-        waypoints = self.boustro_planner.plan(sweep_axis=self.sweep_direction)
-        if not waypoints:
-            self.get_logger().warn(
-                'Boustrophedon planner returned no waypoints. '
-                'Falling back to Spiral-STC.'
-            )
-            self.coverage_running = False
-            self.coverage_mode = 'spiral_stc_known'
-            self.run_coverage_spiral_stc()
-            return
-
-        self.get_logger().info(
-            f'Boustrophedon route size: {len(waypoints)} waypoints '
-            f'(spacing={self.lawnmower_spacing:.2f}m)'
-        )
-        rx, ry, _ = self._get_robot_pose()
-        self._reset_coverage_anchor(rx, ry)
-
-        interrupted = False
-        reached_waypoints = 0
-        skipped_close_waypoints = 0
-        failed_waypoints = 0
-        consecutive_failures = 0
-        # Fast path: drive in NavigateThroughPoses chunks, then resume the
-        # robust per-waypoint loop from the first chunk that fails.
-        resume = self._drive_route_ntp(waypoints)
-        reached_waypoints += resume
-        if resume:
-            self.get_logger().info(
-                f'Boustrophedon: NTP completed {resume}/{len(waypoints)} waypoints.'
-            )
-        for i, (tx, ty) in enumerate(waypoints[resume:], start=resume + 1):
-            if not self.coverage_running:
-                interrupted = True
-                break
-            tx, ty = self._clamp_goal_to_map(tx, ty)
-            rx, ry, _ = self._get_robot_pose()
-            if math.hypot(tx - rx, ty - ry) < max(0.10, self.direct_nav_xy_tolerance):
-                self._mark_covered_to(tx, ty)
-                skipped_close_waypoints += 1
-                continue
-            self._publish_goal(tx, ty)
-
-            ok = False
-            for attempt in range(1, int(self.lawnmower_waypoint_retries) + 1):
-                ok = self.navigator.go_to(tx, ty, prefer_direct=True, timeout=90.0)
-                if ok:
-                    break
-                self.navigator.backup(
-                    distance=min(0.35, 0.15 + 0.07 * attempt),
-                    speed=0.08,
-                    rotate_angle=min(0.9, 0.25 + 0.2 * attempt),
-                )
-            if not ok:
-                failed_waypoints += 1
-                consecutive_failures += 1
-                self.get_logger().warn(
-                    f'Boustrophedon: nav failed at {i}/{len(waypoints)} '
-                    f'({tx:.2f},{ty:.2f}), consecutive_failures={consecutive_failures}'
-                )
-                if consecutive_failures >= int(self.lawnmower_max_consecutive_failures):
-                    self.get_logger().warn(
-                        'Boustrophedon: too many consecutive failures, '
-                        'performing escape rotate and continuing.'
-                    )
-                    self.navigator.rotate_360(angular_speed=0.35)
-                    consecutive_failures = 0
-                continue
-
-            consecutive_failures = 0
-            reached_waypoints += 1
-            self._add_pose(tx, ty)
-            self._mark_covered_to(tx, ty)
-
-        completed_waypoints = reached_waypoints + skipped_close_waypoints
-        completion_ratio = (
-            completed_waypoints / float(len(waypoints))
-            if waypoints else 0.0
-        )
-        meets_completion_ratio = (
-            completion_ratio >= float(self.lawnmower_min_completion_ratio)
-        )
-        if interrupted:
-            self.coverage_running = False
-            reason = 'interrupted' if interrupted else 'insufficient_completion_ratio'
-            self.get_logger().warn(
-                'Boustrophedon coverage ended early/incomplete. '
-                f'reason={reason}, completion={completion_ratio:.1%}, '
-                f'required>={float(self.lawnmower_min_completion_ratio):.1%}, '
-                f'completed={completed_waypoints}/{len(waypoints)}, '
-                f'failed={failed_waypoints}'
-            )
-            self.coverage_complete = False
-        else:
-            if not meets_completion_ratio:
-                self.get_logger().warn(
-                    'Boustrophedon route completion ratio below threshold. '
-                    f'completion={completion_ratio:.1%}, '
-                    f'required>={float(self.lawnmower_min_completion_ratio):.1%}. '
-                    'Trying coverage refinement anyway.'
-                )
-
-            coverage_percent = self._refine_known_map_coverage()
-            self.coverage_running = False
-            self.coverage_complete = coverage_percent >= float(self.coverage_target_percent)
-
-            if self.coverage_complete:
-                self.get_logger().info(
-                    'Boustrophedon coverage completed. '
-                    f'waypoints={completion_ratio:.1%}, '
-                    f'area={coverage_percent:.1f}% '
-                    f'(target {float(self.coverage_target_percent):.1f}%).'
-                )
-            else:
-                self.get_logger().warn(
-                    'Boustrophedon coverage ended below area target. '
-                    f'waypoints={completion_ratio:.1%}, '
-                    f'area={coverage_percent:.1f}%, '
-                    f'target={float(self.coverage_target_percent):.1f}%.'
-                )
-        self._save_visit_log()
-
-    # ------------------------------------------------------------------
-    # Next-Best-View coverage (coverage_mode: 'nbv')
-    # ------------------------------------------------------------------
-    def run_coverage_nbv(self):
-        """Information-gain coverage: repeatedly drive to the OPEN viewpoint
-        that reveals the most still-unseen area, until a high observed-coverage
-        target is met. Credits cells by graded line-of-sight observation
-        (sensor_range) rather than by driving over them."""
-        self.coverage_running = True
-        self.coverage_complete = False
-        self.get_logger().info('═══ HAZMAP COVERAGE STARTING (Next-Best-View) ═══')
-
-        self.get_logger().info('Waiting for /map …')
-        t0 = time.time()
-        while not self.ogm.ready:
-            if time.time() - t0 > 30.0:
-                self.get_logger().error('Timeout waiting for /map!')
-                self.coverage_running = False
-                return
-            time.sleep(0.5)
-
-        self.get_logger().info('Map received — waiting for stabilisation …')
-        time.sleep(3.0)
-
-        self.navigator = Navigator(
-            self,
-            pose_provider=self._get_robot_pose,
-            safety_check=self._direct_safety_check,
-            direct_enabled=self.use_hybrid_navigation,
-            direct_linear_speed=self.direct_nav_linear_speed,
-            direct_angular_speed=self.direct_nav_angular_speed,
-            direct_xy_tolerance=self.direct_nav_xy_tolerance,
-            direct_yaw_tolerance=self.direct_nav_yaw_tolerance,
-            direct_timeout=self.direct_nav_timeout,
-            direct_fallback_to_nav2=self.direct_nav_fallback_to_nav2,
-            scan_topic=self.scan_topic,
-            cmd_vel_topic=self.cmd_vel_topic,
-        )
-        if not self.navigator.is_server_ready():
-            self.get_logger().error('Nav2 action server not ready!')
-            self.coverage_running = False
-            return
-
-        rx, ry, ryaw = self._get_robot_pose()
-        self.get_logger().info(
-            f'NBV start: ({rx:.2f}, {ry:.2f}), sensor_range={self.sensor_range:.2f}m, '
-            f'fov={self.sensor_fov_deg:.0f}°, q_min={self.nbv_q_min:.2f}, '
-            f'target={self.nbv_target_percent:.1f}%'
-        )
-        self._reset_coverage_anchor(rx, ry)
-        self.nbv_selector.record_observation(rx, ry, ryaw)
-
-        new_samples = self.sampler.generate_samples(rx, ry)
-        self.frontier_samples = list(new_samples)
-        if new_samples:
-            new_ids = self.rcg.expand(new_samples)
-            self.rcg.prune(new_ids)
-        self.current_node_id = self._nearest_node_id(rx, ry)
-        self.initialized = True
-
-        target = float(self.nbv_target_percent)
-        no_gain = 0
-        failed_frontiers: list[tuple[float, float]] = []
-        step = 0
-
-        while self.coverage_running:
-            step += 1
-            rx, ry, ryaw = self._get_robot_pose()
-
-            # See from here, then check coverage.
-            self.nbv_selector.record_observation(rx, ry, ryaw)
-            self._publish_observation_grid()
-            pct, obs_area, total_free = self.ogm.get_observation_statistics(
-                self.nbv_q_min
-            )
-            self.get_logger().info(
-                f'  Step {step}: observed={pct:.1f}% '
-                f'({obs_area:.1f}/{total_free:.1f} m²), '
-                f'OPEN={self.rcg.num_open}, no_gain={no_gain}'
-            )
-            if pct >= target:
-                self.get_logger().info(
-                    f'╔══════════════════════════════════╗\n'
-                    f'║   OBSERVED-COVERAGE TARGET MET   ║\n'
-                    f'║   {pct:.1f}% ≥ {target:.1f}% — stopping.\n'
-                    f'╚══════════════════════════════════╝'
-                )
-                self.coverage_complete = True
-                break
-
-            # Grow candidate viewpoints into newly-revealed / unknown area.
-            new_samples = self.sampler.generate_samples(rx, ry)
-            if new_samples:
-                self.frontier_samples = list(new_samples)
-                new_ids = self.rcg.expand(new_samples)
-                self.rcg.prune(new_ids)
-
-            next_id, gain = self.nbv_selector.select_view(
-                self.current_node_id, rx, ry
-            )
-
-            if next_id is None or gain < self.nbv_min_gain:
-                # No worthwhile viewpoint — push into unknown via raw frontier,
-                # so an unknown place keeps getting explored.
-                if self._nbv_push_to_frontier(rx, ry, failed_frontiers):
-                    no_gain = 0
-                    continue
-                no_gain += 1
-                if no_gain >= int(self.nbv_no_gain_patience):
-                    self.get_logger().info(
-                        f'NBV: no information gain for {no_gain} steps and no '
-                        f'reachable frontier — stopping at {pct:.1f}%.'
-                    )
-                    self.coverage_complete = pct >= target
-                    break
-                time.sleep(0.1)
-                continue
-
-            target_node = self.rcg.nodes[next_id]
-            self.get_logger().info(
-                f'  → view {next_id} ({target_node.x:.2f},{target_node.y:.2f}) '
-                f'gain={gain:.1f}'
-            )
-            self._publish_goal(target_node.x, target_node.y)
-            visit_idx = self._log_visit(
-                'nbv', target_node.x, target_node.y, node_id=next_id,
-            )
-            success = self.navigator.go_to(
-                target_node.x, target_node.y, prefer_direct=False
-            )
-            self._mark_visit_result(
-                visit_idx, 'arrived' if success else 'nav_failed',
-            )
-
-            if not success:
-                # Unreachable viewpoint — close it so we stop choosing it.
-                if next_id in self.rcg.nodes:
-                    self.rcg.set_node_state(next_id, NodeState.CLOSED)
-                self.navigator.backup(distance=0.30, speed=0.10, rotate_angle=0.5)
-                no_gain += 1
-                if no_gain >= int(self.nbv_no_gain_patience):
-                    self.get_logger().warn(
-                        'NBV: too many unreachable viewpoints — stopping.'
-                    )
-                    break
-                continue
-
-            no_gain = 0
-            self.current_node_id = next_id
-            self._add_pose(target_node.x, target_node.y)
-            self._mark_covered_to(target_node.x, target_node.y)
-            rx, ry, ryaw = self._get_robot_pose()
-            self.rcg.close_nearby_nodes(rx, ry, self.rc)
-            time.sleep(0.05)
-
-        self._publish_observation_grid()
-        final_pct, _, _ = self.ogm.get_observation_statistics(self.nbv_q_min)
-        self.get_logger().info(
-            f'HazMap NBV finished. Observed coverage {final_pct:.1f}% '
-            f'in {step} steps.'
-        )
-        self._save_visit_log()
-        self.coverage_running = False
-
-    def _nbv_push_to_frontier(
-        self, rx: float, ry: float, failed_frontiers: list
-    ) -> bool:
-        """Reposition toward the nearest unexplored opening (frontier
-        cluster), skipping blacklisted ones, so unknown area keeps getting
-        revealed. Returns True if a reposition was attempted successfully."""
-        blacklist_radius = max(self.w, 0.50)
-        target = self.ogm.find_nearest_frontier_cluster(
-            rx, ry,
-            min_cluster_cells=3,
-            min_distance=max(0.0, self.direct_nav_xy_tolerance),
-            exclude=failed_frontiers,
-            exclude_radius=blacklist_radius,
-        )
-        if target is None:
-            return False
-        tx, ty = self._clamp_goal_to_map(target[0], target[1])
-        self.get_logger().info(
-            f'  NBV: no graph gain — pushing to frontier ({tx:.2f},{ty:.2f}).'
-        )
-        visit_idx = self._log_visit('nbv_frontier', tx, ty)
-        success = self.navigator.go_to(tx, ty, prefer_direct=False, timeout=60.0)
-        self._mark_visit_result(
-            visit_idx, 'arrived' if success else 'nav_failed',
-        )
-        # Blacklist this opening either way: if reached, the next observation
-        # reveals it and new frontiers appear elsewhere; if it stays a frontier
-        # we must not re-pick the same spot (prevents livelock).
-        failed_frontiers.append((tx, ty))
-        if success:
-            self._add_pose(tx, ty)
-            self._mark_covered_to(tx, ty)
-            self.current_node_id = self._nearest_node_id(tx, ty)
-            return True
-        return False
-
-    def _publish_observation_grid(self):
-        """Publish the NBV observation-quality field as an OccupancyGrid
-        (0..100 = sensing quality) for RViz inspection."""
-        grid = self.ogm.observation_quality_grid_int8()
-        if grid is None:
-            return
-        msg = OccupancyGrid()
-        msg.header.frame_id = 'map'
-        msg.header.stamp = self.get_clock().now().to_msg()
-        msg.info.resolution = self.ogm._resolution
-        msg.info.width = self.ogm._width
-        msg.info.height = self.ogm._height
-        msg.info.origin.position.x = self.ogm._origin_x
-        msg.info.origin.position.y = self.ogm._origin_y
-        msg.info.origin.orientation.w = 1.0
-        msg.data = grid.flatten().tolist()
-        self.obs_quality_pub.publish(msg)
-
-    # ------------------------------------------------------------------
-    # Graph-path navigation
-    # ------------------------------------------------------------------
     def _navigate_graph_path(self, from_id: int, to_id: int):
         """Navigate from from_id to to_id along the RCG.
 
@@ -1723,30 +1130,6 @@ class HazMapNode(Node):
         else:
             failed_frontiers.append((tx, ty))
 
-    def _drive_route_ntp(self, waypoints, chunk_size: int = 25) -> int:
-        """Drive a precomputed waypoint route in NavigateThroughPoses chunks.
-
-        Returns the number of waypoints completed before the first failure (or
-        the full count). The caller resumes per-waypoint navigation from there,
-        so the robust single-goal loop stays as the fallback."""
-        completed = 0
-        n = len(waypoints)
-        while completed < n and self.coverage_running:
-            chunk = waypoints[completed:completed + chunk_size]
-            poses = [self._clamp_goal_to_map(wx, wy) for wx, wy in chunk]
-            if not self.navigator.go_through(
-                poses, timeout=max(60.0, 15.0 * len(poses))
-            ):
-                break
-            for px, py in poses:
-                self._add_pose(px, py)
-                self._mark_covered_to(px, py)
-            completed += len(chunk)
-        return completed
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
     def _nearest_node_id(self, x: float, y: float):
         best_id = None
         best_d = float('inf')
@@ -1903,118 +1286,6 @@ class HazMapNode(Node):
                 self.rcg.set_node_state(nid, NodeState.CLOSED)
                 closed += 1
         return closed
-
-    def _refine_known_map_coverage(self):
-        """
-        In known-map mode, keep visiting nearest uncovered FREE cells until
-        coverage_target_percent is reached or progress stalls.
-        """
-        if not self.known_map_mode or self.navigator is None:
-            p, _, _ = self._coverage_stats()
-            return p
-
-        target = float(self.coverage_target_percent)
-        percent, _, _ = self._coverage_stats()
-        if percent >= target:
-            return percent
-
-        attempts              = 0
-        consecutive_nav_fails = 0
-        total_nav_fails       = 0          # never resets — hard ceiling
-        max_goals             = int(self.coverage_refine_max_goals)
-        max_consec_failures   = int(self.coverage_refine_max_nav_failures)
-        max_total_failures    = int(self.coverage_refine_total_failures_limit)
-        timeout_sec           = float(self.coverage_refine_timeout_sec)
-        search_range          = float(self.coverage_refine_search_range)
-        no_gain_patience      = max(1, int(self.coverage_refine_no_gain_patience))
-        min_gain              = max(0.0, float(self.coverage_refine_min_gain_percent))
-        stagnation_count      = 0
-        best_percent          = percent
-        t_start               = time.time()
-
-        self.get_logger().info(
-            f'Coverage refinement: {percent:.1f}% → target {target:.1f}%  '
-            f'(max_goals={max_goals}, timeout={timeout_sec:.0f}s)'
-        )
-
-        while self.coverage_running and attempts < max_goals and percent < target:
-
-            # ── wall-clock timeout ────────────────────────────────────────────
-            elapsed = time.time() - t_start
-            if elapsed >= timeout_sec:
-                self.get_logger().warn(
-                    f'Coverage refinement timed out after {elapsed:.0f}s '
-                    f'at {percent:.1f}%.'
-                )
-                break
-
-            rx, ry, _ = self._get_robot_pose()
-            goal = self.ogm.find_nearest_uncovered_free(
-                rx, ry,
-                max_range=search_range,
-                min_distance=max(0.0, self.direct_nav_xy_tolerance),
-            )
-            if goal is None:
-                self.get_logger().warn(
-                    'Coverage refinement: no uncovered free cell found — done.'
-                )
-                break
-
-            tx, ty = self._clamp_goal_to_map(goal[0], goal[1])
-            attempts += 1
-            self._publish_goal(tx, ty)
-            ok = self.navigator.go_to(tx, ty, prefer_direct=True, timeout=30.0)
-            if not ok:
-                consecutive_nav_fails += 1
-                total_nav_fails       += 1
-                self.get_logger().warn(
-                    f'Coverage refinement: nav fail ({tx:.2f},{ty:.2f})  '
-                    f'consec={consecutive_nav_fails}/{max_consec_failures}  '
-                    f'total={total_nav_fails}/{max_total_failures}'
-                )
-                if consecutive_nav_fails >= max_consec_failures:
-                    self.get_logger().warn(
-                        'Coverage refinement: consecutive failure limit reached.'
-                    )
-                    break
-                if total_nav_fails >= max_total_failures:
-                    self.get_logger().warn(
-                        'Coverage refinement: total failure limit reached.'
-                    )
-                    break
-                self.navigator.backup(distance=0.20, speed=0.08, rotate_angle=0.35)
-                continue
-
-            consecutive_nav_fails = 0
-            self._add_pose(tx, ty)
-            self._mark_covered_to(tx, ty)
-            percent, _, _ = self._coverage_stats()
-            gain = percent - best_percent
-            if gain < min_gain:
-                stagnation_count += 1
-            else:
-                best_percent  = percent
-                stagnation_count = 0
-
-            elapsed = time.time() - t_start
-            if attempts % 3 == 0 or percent >= target:
-                self.get_logger().info(
-                    f'  coverage={percent:.1f}%  target={target:.1f}%  '
-                    f'attempts={attempts}  elapsed={elapsed:.0f}s'
-                )
-            if stagnation_count >= no_gain_patience:
-                self.get_logger().warn(
-                    f'Coverage refinement: stagnated for {stagnation_count} goals '
-                    f'at {percent:.1f}% — stopping.'
-                )
-                break
-
-        elapsed = time.time() - t_start
-        self.get_logger().info(
-            f'Coverage refinement finished: {percent:.1f}%  '
-            f'attempts={attempts}  elapsed={elapsed:.0f}s'
-        )
-        return percent
 
     def _direct_safety_check(self, rx: float, ry: float, tx: float, ty: float) -> bool:
         if not self.ogm.ready:
