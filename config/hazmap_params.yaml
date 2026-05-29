@@ -66,6 +66,15 @@ hazmap_node:
     # 93→94). 0.30 ≈ need >3.3× more gain to deviate from local sweep.
     # 1.0 = disable (pure utility argmax, Phase-0 behavior).
     commit_threshold: 0.30
+    # Phase-6 path-cost penalty. When the straight line from current to a
+    # candidate is collision-blocked, multiply Euclidean cost by this
+    # factor — the real Nav2 path will route around walls, so a Euclidean-
+    # near but path-far candidate should NOT win on cost. Kills the
+    # "0.85 m goal that's actually 10 m around the central enclosure"
+    # pattern (step 18 of the last two sprints, 168s and 179s respectively).
+    # 1.0 = disabled (Euclidean only). 3.0 = blocked candidate needs 3× the
+    # gain to beat an equivalent open-line one.
+    path_blocked_penalty: 3.0
     # Stuck-node patience: force-close an OPEN node selected this many
     # times in a row when the rover can't actually reach within rc of it
     # (the "node 111 at (-3.64,-3.88) infinite-loop" bug at end of run).

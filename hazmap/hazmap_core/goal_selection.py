@@ -27,6 +27,7 @@ class GoalSelector:
         candidate_pool: int = 12,
         same_lap_bonus: float = 1.25,
         commit_threshold: float = 0.30,
+        path_blocked_penalty: float = 3.0,
     ):
         self.rcg = rcg
         self.ogm = ogm
@@ -42,6 +43,13 @@ class GoalSelector:
         # need >3.3× more gain to deviate; 1.0 → pure utility argmax
         # (Phase-0 behavior); 0.0 → always prefer local if any has gain.
         self.commit_threshold = commit_threshold
+        # Phase-6 path-cost blind spot fix: when the straight line from
+        # current to candidate is collision-blocked, Nav2 will route around
+        # — so the real travel cost is much larger than Euclidean. Multiply
+        # Euclidean cost by this factor to demote those candidates. 1.0 =
+        # disabled (Euclidean only, pre-Phase-6 behavior). 3.0 = blocked
+        # candidate needs 3× the gain to beat an equivalent open-line one.
+        self.path_blocked_penalty = path_blocked_penalty
         self.retreat_nodes: Set[int] = set()
 
     def select_goal_node(self, current_id: int) -> Optional[int]:
@@ -79,6 +87,12 @@ class GoalSelector:
             if gain <= 0:
                 continue
             cost = max(0.1, math.hypot(n.x - node.x, n.y - node.y))
+            # Path-cost penalty: blocked straight line ⇒ Nav2 will route
+            # around, real cost is much larger than Euclidean.
+            if (self.path_blocked_penalty > 1.0
+                    and not self.ogm.is_collision_free(
+                        node.x, node.y, n.x, n.y)):
+                cost *= self.path_blocked_penalty
             u = float(gain) / (cost ** self.alpha)
             if n.lap_index == node.lap_index:
                 u *= self.same_lap_bonus
@@ -111,6 +125,10 @@ class GoalSelector:
                 if gain <= 0:
                     continue
                 cost = max(0.1, math.hypot(n.x - node.x, n.y - node.y))
+                if (self.path_blocked_penalty > 1.0
+                        and not self.ogm.is_collision_free(
+                            node.x, node.y, n.x, n.y)):
+                    cost *= self.path_blocked_penalty
                 u = float(gain) / (cost ** self.alpha)
                 if n.lap_index == node.lap_index:
                     u *= self.same_lap_bonus

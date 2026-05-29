@@ -90,6 +90,12 @@ class HazMapNode(Node):
         # >3.3× more gain to deviate (paper-faithful local sweep behavior).
         # Set to 1.0 to disable (pure utility argmax = Phase-0 behavior).
         self.declare_parameter('commit_threshold', 0.30)
+        # Phase-6 path-cost penalty: when the straight line from current to
+        # candidate is collision-blocked, multiply Euclidean cost by this
+        # factor in the utility score. Demotes Euclidean-near but path-far
+        # candidates that would force a long Nav2 detour (the step-18 "0.85m
+        # goal that's actually 10m around the wall" pattern). 1.0 = disabled.
+        self.declare_parameter('path_blocked_penalty', 3.0)
         # If the same OPEN node is selected this many times in a row without
         # the rover physically getting within rc of it, force-close it so
         # the run can't livelock on an unreachable target (e.g. the corner
@@ -207,6 +213,9 @@ class HazMapNode(Node):
         self.commit_threshold = float(
             self.get_parameter('commit_threshold').value
         )
+        self.path_blocked_penalty = float(
+            self.get_parameter('path_blocked_penalty').value
+        )
         self.stuck_node_patience = int(
             self.get_parameter('stuck_node_patience').value
         )
@@ -274,6 +283,7 @@ class HazMapNode(Node):
         self.goal_selector = GoalSelector(
             self.rcg, ogm=self.ogm, rc=self.rc,
             commit_threshold=self.commit_threshold,
+            path_blocked_penalty=self.path_blocked_penalty,
         )
         self.tsp_solver = TSPSolver(self.rcg)
         self.stc_planner = SpiralSTCPlanner(self.ogm, cell_size_m=self.stc_cell_size)
@@ -1686,6 +1696,12 @@ class HazMapNode(Node):
         sweep_dx, sweep_dy = (0.0, 1.0) if sweep_x else (1.0, 0.0)
         out = []
         for cx, cy, _size in clusters:
+            # Clamp cluster centroid to inside-map bounds. Frontier
+            # clustering can return cells right at the boundary; the sampler
+            # then places a candidate that sits *outside* the navigable map
+            # (e.g. node 99 at y=4.53 when map top was ~4.0 in the last
+            # sprint), which Nav2 can never reach → nav_failed loop.
+            cx, cy = self._clamp_goal_to_map(cx, cy)
             perp_proj = cx * perp_dx + cy * perp_dy
             lap_index = int(round(perp_proj / self.w))
             lap_pos = cx * sweep_dx + cy * sweep_dy
