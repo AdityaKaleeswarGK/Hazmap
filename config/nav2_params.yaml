@@ -134,10 +134,10 @@ controller_server:
     # obstacles instead of sampling many trajectories every tick.
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.22            # TB3 Burger top speed
-      lookahead_dist: 0.6
-      min_lookahead_dist: 0.3
-      max_lookahead_dist: 0.9
+      desired_linear_vel: 0.45            # ↑ from 0.22; sim has no TB3 HW cap
+      lookahead_dist: 0.85                # ↑ scaled with speed (was 0.6)
+      min_lookahead_dist: 0.45            # ↑ was 0.3
+      max_lookahead_dist: 1.30            # ↑ was 0.9
       lookahead_time: 1.5
       use_velocity_scaled_lookahead_dist: true
       transform_tolerance: 0.3
@@ -153,8 +153,8 @@ controller_server:
       # arcing — important on a differential base in tight coverage corridors.
       use_rotate_to_heading: true
       rotate_to_heading_min_angle: 0.785
-      rotate_to_heading_angular_vel: 1.5
-      max_angular_accel: 3.0
+      rotate_to_heading_angular_vel: 2.0  # ↑ was 1.5; faster pivots
+      max_angular_accel: 4.0              # ↑ was 3.0; matches faster cmd
       allow_reversing: false
       max_robot_pose_search_dist: 10.0
       # Final-approach behaviour.
@@ -334,10 +334,10 @@ velocity_smoother:
     smoothing_frequency: 20.0
     scale_velocities: False
     feedback: "OPEN_LOOP"
-    max_velocity: [0.22, 0.0, 1.5]
-    min_velocity: [-0.22, 0.0, -1.5]
-    max_accel: [2.0, 0.0, 3.0]
-    max_decel: [-2.0, 0.0, -3.0]
+    max_velocity: [0.45, 0.0, 2.0]      # ↑ linear+angular; sim has no HW cap
+    min_velocity: [-0.45, 0.0, -2.0]
+    max_accel: [3.0, 0.0, 4.0]
+    max_decel: [-3.0, 0.0, -4.0]
     odom_topic: "odom"
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]

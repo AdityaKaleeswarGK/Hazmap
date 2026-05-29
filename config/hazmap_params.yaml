@@ -1,6 +1,10 @@
 hazmap_node:
   ros__parameters:
-    w: 0.750                # lap spacing (sampling resolution)
+    w: 1.000                # lap spacing — ↑ from 0.75. Fewer laps in open
+                            # areas (your "less laps could have been taken"
+                            # observation). Sampler's obstacle-adjacency filter
+                            # still places nodes in tight regions, so this
+                            # mostly trims redundant open-space laps.
     rc: 0.375               # coverage radius per waypoint (≈ w/2)
     rd: 3.0                 # detection/sampling lookahead radius
     delta: 1                # kept for compat (unused by C* sampler)
@@ -12,8 +16,8 @@ hazmap_node:
     use_hybrid_navigation: true
     direct_nav_same_lap_only: false     
     direct_nav_max_distance: 0.70       # max edge length for direct mode
-    direct_nav_linear_speed: 0.20       # m/s — faster with LiDAR safety
-    direct_nav_angular_speed: 1.00      # rad/s — responsive turning
+    direct_nav_linear_speed: 0.40       # ↑ from 0.20 — short-hop top speed
+    direct_nav_angular_speed: 1.80      # ↑ from 1.00 — snappier turning
     direct_nav_xy_tolerance: 0.08       # arrival tolerance (m)
     direct_nav_yaw_tolerance: 0.30      # heading tolerance before moving (rad)
     direct_nav_timeout: 20.0            # seconds
@@ -57,6 +61,11 @@ hazmap_node:
     # times in a row when the rover can't actually reach within rc of it
     # (the "node 111 at (-3.64,-3.88) infinite-loop" bug at end of run).
     stuck_node_patience: 3
+    # Total reselects (not just consecutive) before force-closing as
+    # unreachable. Fixes the late-game pattern where the selector cycles
+    # through a small ring of physically-unreachable frontier nodes,
+    # preventing termination.
+    stuck_node_total_patience: 5
 
     # ── Phase 2: en-route node closing ───────────────────────────────────
     # After each traverse, close OPEN nodes the rover physically drove over

@@ -95,6 +95,11 @@ class HazMapNode(Node):
         # the run can't livelock on an unreachable target (e.g. the corner
         # node that sits 0.02 m outside reach inside an inflated wall).
         self.declare_parameter('stuck_node_patience', 3)
+        # Late-game termination guard: if a node is *re*-selected this many
+        # times across the whole inner loop (not just consecutively) without
+        # ever closing, force-close it. Catches the "ring of unreachable
+        # frontier nodes cycling forever" pattern at the end of a run.
+        self.declare_parameter('stuck_node_total_patience', 5)
         # ── Phase 2: en-route node closing ───────────────────────────────
         # After each traverse, CLOSE OPEN nodes the rover physically drove
         # over (within enroute_close_radius of the path segment) and that are
@@ -181,6 +186,9 @@ class HazMapNode(Node):
         )
         self.stuck_node_patience = int(
             self.get_parameter('stuck_node_patience').value
+        )
+        self.stuck_node_total_patience = int(
+            self.get_parameter('stuck_node_total_patience').value
         )
         self.enroute_close_enable = self.get_parameter(
             'enroute_close_enable'
@@ -525,6 +533,7 @@ class HazMapNode(Node):
         # inside the costmap inflation). Force-close after N reselects.
         last_selected_id = None
         same_id_streak = 0
+        node_visit_counts: dict = {}
 
         while self.coverage_running:
             outer_iter += 1
@@ -561,13 +570,31 @@ class HazMapNode(Node):
 
                 next_id = self.goal_selector.select_goal_node(self.current_node_id)
 
-                # Stuck-node safety: if the selector keeps returning the
-                # same OPEN node and the rover never gets within rc of it
-                # (close_nearby_nodes doesn't fire on arrival), force-close
-                # it after stuck_node_patience reselects. Without this the
-                # inner loop livelocks on a corner node lodged just outside
-                # reach inside the costmap inflation (e.g. node 111 at the
-                # end of the last sprint).
+                # Stuck-node safety: two paths.
+                # (a) Consecutive reselects of the same node → force-close after
+                #     stuck_node_patience (handles the node-111 corner case).
+                # (b) Total reselects of the *same* node across the whole inner
+                #     loop → force-close after stuck_node_total_patience. This
+                #     catches the late-game pattern where the selector cycles
+                #     through a small ring of physically-unreachable frontier
+                #     nodes (last sprint: 6 OPEN nodes at run end, none ever
+                #     hit the consecutive-3 threshold, so the run hung).
+                if next_id is not None:
+                    node_visit_counts[next_id] = (
+                        node_visit_counts.get(next_id, 0) + 1
+                    )
+                    if (node_visit_counts[next_id]
+                            >= self.stuck_node_total_patience):
+                        self.get_logger().warn(
+                            f'  Node {next_id} selected '
+                            f'{node_visit_counts[next_id]}× total without '
+                            f'closing — force-closing as unreachable.'
+                        )
+                        self.rcg.set_node_state(next_id, NodeState.CLOSED)
+                        last_selected_id = None
+                        same_id_streak = 0
+                        node_visit_counts.pop(next_id, None)
+                        continue
                 if (next_id is not None and next_id == last_selected_id
                         and self.current_node_id != next_id):
                     same_id_streak += 1
