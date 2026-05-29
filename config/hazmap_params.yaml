@@ -30,6 +30,22 @@ hazmap_node:
     # will push past 70% productively.
     coverage_target_percent: 95.0
 
+    # ── Coverage-saturation pruning ──────────────────────────────────────
+    # Shifts the stopping logic from "visit every node" to "stop when no
+    # node still adds coverage or leads into the unknown." Periodically
+    # CLOSES OPEN nodes that sit in already-covered, fully-known space, so
+    # the rover stops crossing the covered map to tick off redundant nodes
+    # (the main cause of late-game trajectory overlap). Frontier nodes
+    # (adjacent to unknown) are kept when prune_keep_frontier is true.
+    #   prune_gain_min_cells: a node is "redundant" if fewer than this many
+    #     uncovered free cells lie within its coverage radius. Higher =
+    #     prune more aggressively = less overlap but slightly less coverage.
+    #     Units are grid cells (≈ resolution² m² each, e.g. 15 ≈ 0.04 m²).
+    prune_enable: true
+    prune_interval: 4              # steps between prune sweeps
+    prune_gain_min_cells: 15       # below this uncovered-cell count = redundant
+    prune_keep_frontier: true      # never prune nodes bordering unknown
+
     # ── Next-Best-View mode (set coverage_mode: "nbv") ──────────────────
     # Surveillance / gas-mapping style coverage: the rover drives to the
     # viewpoint that *reveals* the most still-unseen area, crediting cells

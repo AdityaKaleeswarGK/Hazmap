@@ -73,6 +73,17 @@ class HazMapNode(Node):
         self.declare_parameter('coverage_refine_search_range', 100.0)
         self.declare_parameter('coverage_refine_no_gain_patience', 10)
         self.declare_parameter('coverage_refine_min_gain_percent', 0.20)
+        # ── Coverage-saturation pruning (shift from node-exhaustion) ─────
+        # Periodically CLOSE OPEN nodes that sit in already-covered, fully
+        # known space (low coverage gain AND not bordering unknown). This
+        # stops the rover from crossing the covered map just to "tick off"
+        # redundant nodes — the main source of late-game trajectory overlap.
+        # Frontier nodes (adjacent to unknown) are always kept so genuine
+        # unexplored regions still get a goal.
+        self.declare_parameter('prune_enable', True)
+        self.declare_parameter('prune_interval', 4)         # steps between sweeps
+        self.declare_parameter('prune_gain_min_cells', 15)  # < this = redundant
+        self.declare_parameter('prune_keep_frontier', True)
         # ── Next-Best-View (coverage_mode: 'nbv') ────────────────────────
         self.declare_parameter('sensor_range', 0.0)          # 0 → fall back to rd
         self.declare_parameter('sensor_fov_deg', 360.0)
@@ -141,6 +152,12 @@ class HazMapNode(Node):
         self.coverage_refine_min_gain_percent = self.get_parameter(
             'coverage_refine_min_gain_percent'
         ).value
+        self.prune_enable = self.get_parameter('prune_enable').value
+        self.prune_interval = max(1, int(self.get_parameter('prune_interval').value))
+        self.prune_gain_min_cells = int(
+            self.get_parameter('prune_gain_min_cells').value
+        )
+        self.prune_keep_frontier = self.get_parameter('prune_keep_frontier').value
         _sensor_range = self.get_parameter('sensor_range').value
         self.sensor_range = _sensor_range if _sensor_range > 0.0 else self.rd
         self.sensor_fov_deg = self.get_parameter('sensor_fov_deg').value
@@ -485,8 +502,23 @@ class HazMapNode(Node):
             while self.coverage_running:
                 step += 1
 
+                # Coverage-saturation pruning: drop OPEN nodes sitting in
+                # already-covered, fully-known space so the selector never
+                # crosses the map to "tick off" redundant nodes. Done before
+                # selection (we've already arrived; current node is CLOSED).
+                if self.prune_enable and (step % self.prune_interval == 1):
+                    n_pruned = self._prune_redundant_open_nodes()
+                    if n_pruned and self.debug:
+                        self.get_logger().info(
+                            f'  Pruned {n_pruned} redundant OPEN nodes '
+                            f'(covered & known); OPEN now {self.rcg.num_open}'
+                        )
+
                 if self.rcg.num_open == 0:
-                    self.get_logger().info('All nodes covered.')
+                    self.get_logger().info(
+                        'No productive OPEN nodes remain '
+                        '(all covered or pruned).'
+                    )
                     break
 
                 next_id = self.goal_selector.select_goal_node(self.current_node_id)
@@ -621,8 +653,13 @@ class HazMapNode(Node):
                 # cross-map jump to the largest distant frontier cluster, so
                 # remote unexplored regions don't get starved by local lap
                 # selection (the bottom-right-unknown case).
+                # Region jump only when we're actually stuck (no recent
+                # coverage progress), not on a fixed timer — a periodic
+                # cross-map dash was itself a big overlap contributor. When
+                # the local selector is productive, leave it alone.
                 region_inject_counter += 1
-                if region_inject_counter >= REGION_INJECT_INTERVAL:
+                if (stagnation_count >= 2
+                        and region_inject_counter >= REGION_INJECT_INTERVAL):
                     region_inject_counter = 0
                     self._inject_region_jump(rx, ry, failed_frontiers)
 
@@ -1599,6 +1636,37 @@ class HazMapNode(Node):
     def _coverage_stats(self):
         """Return current coverage stats as (percent, area_m2, total_m2)."""
         return self.ogm.get_coverage_statistics()
+
+    def _prune_redundant_open_nodes(self) -> int:
+        """Close OPEN nodes that are no longer worth visiting: their local
+        area is already covered (coverage gain below threshold) AND they do
+        not border unknown space. Frontier nodes (adjacent to unknown) are
+        always kept so genuine unexplored regions still get a goal.
+
+        This is the core of the coverage-saturation strategy: instead of
+        driving to *every* node, the rover only chases nodes that still add
+        new coverage or that lead into the unknown. Returns the count closed.
+        """
+        if not self.prune_enable or not self.ogm.ready:
+            return 0
+        radius = max(self.rc, 0.5 * self.w)
+        pruned = 0
+        for nid in list(self.rcg._open_ids):
+            node = self.rcg.nodes.get(nid)
+            if node is None:
+                continue
+            # Never prune the node we're currently sitting on.
+            if nid == self.current_node_id:
+                continue
+            if self.prune_keep_frontier and self.ogm.is_adjacent_to_unknown(
+                node.x, node.y, self.w
+            ):
+                continue
+            gain = self.ogm.predict_coverage_gain(node.x, node.y, radius)
+            if gain < self.prune_gain_min_cells:
+                self.rcg.set_node_state(nid, NodeState.CLOSED)
+                pruned += 1
+        return pruned
 
     def _refine_known_map_coverage(self):
         """
