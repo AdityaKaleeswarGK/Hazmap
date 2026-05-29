@@ -99,6 +99,18 @@ class HazMapNode(Node):
         self.declare_parameter('reopen_growth_threshold', 1.8)
         self.declare_parameter('reopen_min_new_frontier', 6)
         self.declare_parameter('reopen_max_per_node', 2)
+        # ── Surface inspection (orbit obstacles, view all faces) ─────────
+        # surface_view_lambda=0 disables (pure coverage). >0 makes the goal
+        # selector reward viewpoints that newly inspect obstacle surfaces
+        # from the camera's usable range band [min_view, max_view], and the
+        # rover orbits obstacles to view every face. Defaults model a
+        # medium-range camera (good framing ~1–3 m).
+        self.declare_parameter('surface_view_lambda', 0.0)
+        self.declare_parameter('surface_sensor_range', 3.0)
+        self.declare_parameter('surface_min_view', 1.0)
+        self.declare_parameter('surface_max_view', 3.0)
+        self.declare_parameter('surface_n_rays', 48)
+        self.declare_parameter('surface_q_min', 0.4)  # quality → "inspected"
 
         self.w = self.get_parameter('w').value
         self.rc = self.get_parameter('rc').value
@@ -179,6 +191,12 @@ class HazMapNode(Node):
         self.reopen_max_per_node = int(
             self.get_parameter('reopen_max_per_node').value
         )
+        self.surface_view_lambda = self.get_parameter('surface_view_lambda').value
+        self.surface_sensor_range = self.get_parameter('surface_sensor_range').value
+        self.surface_min_view = self.get_parameter('surface_min_view').value
+        self.surface_max_view = self.get_parameter('surface_max_view').value
+        self.surface_n_rays = int(self.get_parameter('surface_n_rays').value)
+        self.surface_q_min = self.get_parameter('surface_q_min').value
 
         # ── C* core algorithm objects ────────────────────────────────
         self.ogm = OccupancyGridManager(free_threshold=50)
@@ -205,6 +223,11 @@ class HazMapNode(Node):
             rc=self.rc,
             alpha=self.nbv_cost_weight,
             lambda_unknown=self.info_gain_lambda,
+            lambda_surface=self.surface_view_lambda,
+            surface_sensor_range=self.surface_sensor_range,
+            surface_min_view=self.surface_min_view,
+            surface_max_view=self.surface_max_view,
+            surface_n_rays=self.surface_n_rays,
         )
         self.tsp_solver = TSPSolver(self.rcg)
         self.stc_planner = SpiralSTCPlanner(self.ogm, cell_size_m=self.stc_cell_size)
@@ -260,6 +283,9 @@ class HazMapNode(Node):
         )
         self.obs_quality_pub = self.create_publisher(
             OccupancyGrid, 'hazmap/observation_quality', map_qos
+        )
+        self.surface_quality_pub = self.create_publisher(
+            OccupancyGrid, 'hazmap/surface_quality', map_qos
         )
 
         self.create_service(
@@ -627,6 +653,18 @@ class HazMapNode(Node):
                 self._mark_covered_to(arrived.x, arrived.y)
 
                 rx, ry = self._robot_x, self._robot_y
+                # Surface inspection: record obstacle faces the camera views
+                # from this pose (within its usable range band). Once a face
+                # is inspected its surface-gain drops, so the next pick favors
+                # an un-inspected face → the rover orbits the obstacle.
+                if self.surface_view_lambda > 0.0:
+                    self.ogm.mark_surface_seen(
+                        rx, ry,
+                        self.surface_sensor_range,
+                        self.surface_min_view,
+                        self.surface_max_view,
+                        n_rays=self.surface_n_rays,
+                    )
                 self.rcg.close_nearby_nodes(rx, ry, self.rc)
                 self.goal_selector.update_retreat_nodes(rx, ry)
 
@@ -1366,6 +1404,24 @@ class HazMapNode(Node):
         msg.data = grid.flatten().tolist()
         self.obs_quality_pub.publish(msg)
 
+    def _publish_surface_grid(self):
+        """Publish the surface-inspection-quality field as an OccupancyGrid
+        (0..100 = how well each obstacle face has been viewed) for RViz."""
+        grid = self.ogm.surface_quality_grid_int8()
+        if grid is None:
+            return
+        msg = OccupancyGrid()
+        msg.header.frame_id = 'map'
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.info.resolution = self.ogm._resolution
+        msg.info.width = self.ogm._width
+        msg.info.height = self.ogm._height
+        msg.info.origin.position.x = self.ogm._origin_x
+        msg.info.origin.position.y = self.ogm._origin_y
+        msg.info.origin.orientation.w = 1.0
+        msg.data = grid.flatten().tolist()
+        self.surface_quality_pub.publish(msg)
+
     # ------------------------------------------------------------------
     # Coverage hole detection (uses C* TSPSolver)
     # ------------------------------------------------------------------
@@ -1857,6 +1913,8 @@ class HazMapNode(Node):
         self._pub_laps(now)
         self._pub_path(now)
         self._pub_frontier_points(now)
+        if self.surface_view_lambda > 0.0:
+            self._publish_surface_grid()
 
     def _pub_nodes(self, stamp):
         ma = MarkerArray()

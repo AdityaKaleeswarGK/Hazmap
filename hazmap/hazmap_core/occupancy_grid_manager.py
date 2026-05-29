@@ -41,6 +41,18 @@ class OccupancyGridManager:
         self._observation_quality: Optional[np.ndarray] = None
         self._observation_views: List[Tuple[float, float, float, float, int]] = []
 
+        # ── Surface-inspection model ──────────────────────────────────────
+        # Per-OBSTACLE-cell best inspection quality (0..1) with which each
+        # obstacle surface cell has been *viewed* from within the camera's
+        # usable range band [min_view, max_view] and with line of sight.
+        # Distinct from _observation_quality (which records free cells seen).
+        # Drives the "orbit obstacles and view all faces" behavior: a
+        # candidate that would newly view un-inspected surface scores higher.
+        # Rebuilt from recorded surface-view history on map resize, like the
+        # other two grids.
+        self._surface_seen: Optional[np.ndarray] = None
+        self._surface_views: List[Tuple[float, float, float, float, float, int]] = []
+
     # ------------------------------------------------------------------
     # Update from ROS message
     # ------------------------------------------------------------------
@@ -85,6 +97,7 @@ class OccupancyGridManager:
             # world-coord centers, so coverage stats survive map jumps.
             self._rebuild_covered_map()
             self._rebuild_observation_quality()
+            self._rebuild_surface_seen()
         else:
             for wx, wy, r in self._pending_paints:
                 self._paint_circle_on_map(wx, wy, r)
@@ -577,6 +590,170 @@ class OccupancyGridManager:
             if q > cur:
                 gain += q - cur
         return gain
+
+    # ------------------------------------------------------------------
+    # Surface inspection (view obstacle faces from the camera range band)
+    # ------------------------------------------------------------------
+    def _rebuild_surface_seen(self) -> None:
+        """Allocate a fresh surface-quality grid and replay the view history."""
+        if self._data is None:
+            self._surface_seen = None
+            return
+        self._surface_seen = np.zeros(
+            (self._height, self._width), dtype=np.float32
+        )
+        for vx, vy, vr, vmin, vmax, vrays in self._surface_views:
+            self._cast_surface(vx, vy, vr, vmin, vmax, vrays, commit=True)
+
+    def mark_surface_seen(
+        self,
+        wx: float,
+        wy: float,
+        sensor_range: float,
+        min_view: float,
+        max_view: float,
+        n_rays: int = 72,
+    ) -> None:
+        """Raycast from a viewpoint and record every obstacle surface cell
+        hit within the usable camera band [min_view, max_view] (with line of
+        sight). Quality peaks mid-band and falls off toward the edges, so the
+        selector prefers viewpoints that frame a surface at a comfortable
+        distance rather than grazing it."""
+        self._surface_views.append(
+            (wx, wy, sensor_range, min_view, max_view, n_rays)
+        )
+        if self._data is None:
+            return  # map not ready; replayed on first update()
+        if (
+            self._surface_seen is None
+            or self._surface_seen.shape != (self._height, self._width)
+        ):
+            self._rebuild_surface_seen()
+            return
+        self._cast_surface(
+            wx, wy, sensor_range, min_view, max_view, n_rays, commit=True
+        )
+
+    def predict_surface_gain(
+        self,
+        wx: float,
+        wy: float,
+        sensor_range: float,
+        min_view: float,
+        max_view: float,
+        n_rays: int = 72,
+    ) -> float:
+        """New surface-inspection quality a viewpoint would add WITHOUT
+        committing: sum over viewable obstacle cells of max(0, q_new - q_cur).
+        Zero once every surface this viewpoint can see is already inspected —
+        which is what makes the rover move on / orbit to an un-inspected face."""
+        if self._data is None:
+            return 0.0
+        return self._cast_surface(
+            wx, wy, sensor_range, min_view, max_view, n_rays, commit=False
+        )
+
+    def _cast_surface(
+        self,
+        wx: float,
+        wy: float,
+        sensor_range: float,
+        min_view: float,
+        max_view: float,
+        n_rays: int,
+        commit: bool,
+    ) -> float:
+        """Shared surface raycast. Walks rays until they hit an obstacle (or
+        unknown / range limit). An obstacle cell hit at distance d within
+        [min_view, max_view] is the inspectable surface; its quality is a
+        triangular falloff that peaks at the band midpoint. 360° because the
+        rover can rotate the camera in place at a viewpoint."""
+        if self._data is None:
+            return 0.0
+        gx0, gy0 = self.world_to_grid(wx, wy)
+        if not self._in_bounds(gx0, gy0):
+            return 0.0
+        cap = min(sensor_range, max_view)
+        range_cells = max(1, int(cap / self._resolution))
+        n_rays = max(1, int(n_rays))
+        mid = 0.5 * (min_view + max_view)
+        half_span = max(1e-3, 0.5 * (max_view - min_view))
+
+        seen: dict = {} if not commit else None
+        for i in range(n_rays):
+            ang = 2.0 * math.pi * (i / n_rays)
+            ex = gx0 + int(round(range_cells * math.cos(ang)))
+            ey = gy0 + int(round(range_cells * math.sin(ang)))
+            for gx, gy in self._bresenham(gx0, gy0, ex, ey):
+                if gx == gx0 and gy == gy0:
+                    continue
+                if not self._in_bounds(gx, gy):
+                    break
+                d = math.hypot(gx - gx0, gy - gy0) * self._resolution
+                if d > cap:
+                    break
+                v = int(self._data[gy, gx])
+                if v == self.UNKNOWN:
+                    break  # cannot see past unknown space
+                if v >= self._free_threshold:
+                    # Obstacle surface cell. Credit it only if it sits within
+                    # the usable band; too close (out of focus / framing) or
+                    # beyond range does not count as a good inspection view.
+                    if d >= min_view:
+                        q = 1.0 - abs(d - mid) / half_span
+                        if q > 0.0:
+                            if commit:
+                                if q > self._surface_seen[gy, gx]:
+                                    self._surface_seen[gy, gx] = q
+                            else:
+                                prev = seen.get((gy, gx))
+                                if prev is None or q > prev:
+                                    seen[(gy, gx)] = q
+                    break  # ray stops at the obstacle either way
+        if commit:
+            return 0.0
+        gain = 0.0
+        for (gy, gx), q in seen.items():
+            cur = (
+                float(self._surface_seen[gy, gx])
+                if self._surface_seen is not None
+                else 0.0
+            )
+            if q > cur:
+                gain += q - cur
+        return gain
+
+    def surface_quality_grid_int8(self) -> Optional[np.ndarray]:
+        """Surface-inspection quality scaled to 0..100 int8 for RViz."""
+        if self._surface_seen is None:
+            return None
+        scaled = np.clip(self._surface_seen * 100.0, 0, 100)
+        return scaled.astype(np.int8)
+
+    def get_surface_statistics(
+        self, q_min: float, view_radius: float
+    ) -> Tuple[float, float, float]:
+        """Surface-inspection coverage: (percent, inspected_cells,
+        total_inspectable_cells). "Inspectable" = obstacle cells adjacent to
+        known free space (i.e. surfaces a camera could ever reach), within
+        view_radius logic handled by the caller. A surface counts inspected
+        once its quality reaches q_min."""
+        if self._data is None or self._surface_seen is None:
+            return 0.0, 0.0, 0.0
+        obstacles = self._data >= self._free_threshold
+        frees = (self._data >= 0) & (self._data < self._free_threshold)
+        # Obstacle cells adjacent to free space = reachable surfaces.
+        adj = np.zeros_like(obstacles)
+        adj[1:, :] |= frees[:-1, :]
+        adj[:-1, :] |= frees[1:, :]
+        adj[:, 1:] |= frees[:, :-1]
+        adj[:, :-1] |= frees[:, 1:]
+        inspectable = obstacles & adj
+        total = float(np.sum(inspectable))
+        if total == 0:
+            return 0.0, 0.0, 0.0
+        inspected = float(np.sum(inspectable & (self._surface_seen >= q_min)))
+        return 100.0 * inspected / total, inspected, total
 
     def get_observation_statistics(
         self, q_min: float

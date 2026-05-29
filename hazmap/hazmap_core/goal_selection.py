@@ -26,6 +26,11 @@ class GoalSelector:
         alpha: float = 1.0,
         candidate_pool: int = 12,
         lambda_unknown: float = 0.0,
+        lambda_surface: float = 0.0,
+        surface_sensor_range: float = 3.0,
+        surface_min_view: float = 1.0,
+        surface_max_view: float = 3.0,
+        surface_n_rays: int = 48,
     ):
         self.rcg = rcg
         self.ogm = ogm
@@ -33,6 +38,14 @@ class GoalSelector:
         self.alpha = alpha
         self.candidate_pool = candidate_pool
         self.lambda_unknown = lambda_unknown
+        # Surface-inspection term: rewards candidates that would newly view
+        # un-inspected obstacle faces from the camera's usable range band.
+        # 0 disables (pure coverage). >0 makes the rover orbit obstacles.
+        self.lambda_surface = lambda_surface
+        self.surface_sensor_range = surface_sensor_range
+        self.surface_min_view = surface_min_view
+        self.surface_max_view = surface_max_view
+        self.surface_n_rays = surface_n_rays
         self.retreat_nodes: Set[int] = set()
 
     def select_goal_node(self, current_id: int) -> Optional[int]:
@@ -84,6 +97,14 @@ class GoalSelector:
             gain = self.ogm.predict_coverage_gain(
                 n.x, n.y, radius, lambda_unknown=self.lambda_unknown,
             )
+            if self.lambda_surface > 0.0:
+                gain += self.lambda_surface * self.ogm.predict_surface_gain(
+                    n.x, n.y,
+                    self.surface_sensor_range,
+                    self.surface_min_view,
+                    self.surface_max_view,
+                    n_rays=self.surface_n_rays,
+                )
             if gain <= 0:
                 continue
             cost = max(0.1, math.hypot(n.x - node.x, n.y - node.y))

@@ -73,3 +73,21 @@ hazmap_node:
     reopen_min_new_frontier: 6
     reopen_max_per_node: 2
 
+    # ── Surface inspection (orbit obstacles, view all faces) ─────────────
+    # When surface_view_lambda > 0, the goal selector adds a term that
+    # rewards viewpoints which newly inspect obstacle surfaces seen (with
+    # line of sight) from within the camera's usable range band
+    # [surface_min_view, surface_max_view]. As each face is inspected its
+    # contribution drops to zero, so the rover naturally orbits an obstacle
+    # to view its remaining faces, then moves on. Set to 0 for pure 2D
+    # coverage (no surface inspection). Defaults model a medium-range
+    # camera that frames surfaces well at ~1–3 m. Tune the lambda relative
+    # to coverage gain: too low → surfaces ignored; too high → rover fixates
+    # on obstacles before covering open space.
+    surface_view_lambda: 3.0
+    surface_sensor_range: 3.0      # max raycast range for surface views (m)
+    surface_min_view: 1.0          # below this, too close to frame (m)
+    surface_max_view: 3.0          # beyond this, too far to inspect (m)
+    surface_n_rays: 48             # rays per surface raycast (perf vs detail)
+    surface_q_min: 0.4             # quality at which a face counts "inspected"
+
