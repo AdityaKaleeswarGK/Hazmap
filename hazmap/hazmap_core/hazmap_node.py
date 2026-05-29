@@ -84,6 +84,17 @@ class HazMapNode(Node):
         self.declare_parameter('prune_interval', 4)         # steps between sweeps
         self.declare_parameter('prune_gain_min_cells', 15)  # < this = redundant
         self.declare_parameter('prune_keep_frontier', True)
+        # ── Phase 1: local commitment + stuck-node safety ────────────────
+        # commit_threshold: pick a direct lap neighbor unless a far candidate
+        # has > 1/commit_threshold times more uncovered area. 0.30 = need
+        # >3.3× more gain to deviate (paper-faithful local sweep behavior).
+        # Set to 1.0 to disable (pure utility argmax = Phase-0 behavior).
+        self.declare_parameter('commit_threshold', 0.30)
+        # If the same OPEN node is selected this many times in a row without
+        # the rover physically getting within rc of it, force-close it so
+        # the run can't livelock on an unreachable target (e.g. the corner
+        # node that sits 0.02 m outside reach inside an inflated wall).
+        self.declare_parameter('stuck_node_patience', 3)
         # ── Next-Best-View (coverage_mode: 'nbv') ────────────────────────
         self.declare_parameter('sensor_range', 0.0)          # 0 → fall back to rd
         self.declare_parameter('sensor_fov_deg', 360.0)
@@ -158,6 +169,12 @@ class HazMapNode(Node):
             self.get_parameter('prune_gain_min_cells').value
         )
         self.prune_keep_frontier = self.get_parameter('prune_keep_frontier').value
+        self.commit_threshold = float(
+            self.get_parameter('commit_threshold').value
+        )
+        self.stuck_node_patience = int(
+            self.get_parameter('stuck_node_patience').value
+        )
         _sensor_range = self.get_parameter('sensor_range').value
         self.sensor_range = _sensor_range if _sensor_range > 0.0 else self.rd
         self.sensor_fov_deg = self.get_parameter('sensor_fov_deg').value
@@ -186,7 +203,10 @@ class HazMapNode(Node):
             known_map_mode=self.known_map_mode,
         )
         self.rcg = RCG(self.w, self.ogm)
-        self.goal_selector = GoalSelector(self.rcg, ogm=self.ogm, rc=self.rc)
+        self.goal_selector = GoalSelector(
+            self.rcg, ogm=self.ogm, rc=self.rc,
+            commit_threshold=self.commit_threshold,
+        )
         self.tsp_solver = TSPSolver(self.rcg)
         self.stc_planner = SpiralSTCPlanner(self.ogm, cell_size_m=self.stc_cell_size)
         self.boustro_planner = BoustrophedonPlanner(
@@ -487,6 +507,11 @@ class HazMapNode(Node):
         stagnation_count = 0
         prev_area_covered = 0.0
         prev_total_free = 0.0
+        # Track repeated selection of the same OPEN node when the rover
+        # physically can't get within rc of it (e.g. corner nodes lodged
+        # inside the costmap inflation). Force-close after N reselects.
+        last_selected_id = None
+        same_id_streak = 0
 
         while self.coverage_running:
             outer_iter += 1
@@ -522,6 +547,29 @@ class HazMapNode(Node):
                     break
 
                 next_id = self.goal_selector.select_goal_node(self.current_node_id)
+
+                # Stuck-node safety: if the selector keeps returning the
+                # same OPEN node and the rover never gets within rc of it
+                # (close_nearby_nodes doesn't fire on arrival), force-close
+                # it after stuck_node_patience reselects. Without this the
+                # inner loop livelocks on a corner node lodged just outside
+                # reach inside the costmap inflation (e.g. node 111 at the
+                # end of the last sprint).
+                if (next_id is not None and next_id == last_selected_id
+                        and self.current_node_id != next_id):
+                    same_id_streak += 1
+                    if same_id_streak >= self.stuck_node_patience:
+                        self.get_logger().warn(
+                            f'  Stuck on node {next_id} after '
+                            f'{same_id_streak} reselects — force-closing.'
+                        )
+                        self.rcg.set_node_state(next_id, NodeState.CLOSED)
+                        last_selected_id = None
+                        same_id_streak = 0
+                        continue  # re-enter loop top, will reselect
+                else:
+                    same_id_streak = 0
+                last_selected_id = next_id
 
                 if next_id is None:
                     # Dead end — escape via retreat/nearest open node

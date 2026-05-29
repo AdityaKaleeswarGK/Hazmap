@@ -26,6 +26,7 @@ class GoalSelector:
         alpha: float = 1.0,
         candidate_pool: int = 12,
         same_lap_bonus: float = 1.25,
+        commit_threshold: float = 0.30,
     ):
         self.rcg = rcg
         self.ogm = ogm
@@ -33,6 +34,14 @@ class GoalSelector:
         self.alpha = alpha
         self.candidate_pool = candidate_pool
         self.same_lap_bonus = same_lap_bonus
+        # Phase-1 local-commitment knob. A direct lap neighbor wins over the
+        # best far candidate as long as
+        #   neighbor_gain >= commit_threshold * far_gain
+        # i.e. we only abandon a local sweep when a far candidate would
+        # reveal more than 1/commit_threshold times more new area. 0.30 →
+        # need >3.3× more gain to deviate; 1.0 → pure utility argmax
+        # (Phase-0 behavior); 0.0 → always prefer local if any has gain.
+        self.commit_threshold = commit_threshold
         self.retreat_nodes: Set[int] = set()
 
     def select_goal_node(self, current_id: int) -> Optional[int]:
@@ -49,35 +58,20 @@ class GoalSelector:
                     return nb.id
             return self._escape_dead_end(current_id)
 
-        # Utility-based selection: argmax (gain / cost^alpha), with a small
-        # same-lap bonus so the sweep pattern persists when costs tie.
-        # Candidates = OPEN direct neighbors + nearest OPEN nodes overall,
-        # so the selector can break out of a lap when something nearby is
-        # much more informative (e.g. an opening into an uncovered region).
-        candidates: Set[int] = set()
+        radius = max(self.rc, 0.5 * self.rcg.w)
+
+        # ── Tier 1: direct lap neighbors (left/up/down/right) ─────────────
+        # Score by utility within this set. Same-lap bonus preserved.
+        local_ids: Set[int] = set()
         for direction in ["left", "up", "down", "right"]:
             for nid in node.neighbors.get(direction, []):
                 n = self.rcg.nodes.get(nid)
                 if n is not None and n.state == NodeState.OPEN:
-                    candidates.add(nid)
-        nearest = sorted(
-            (
-                (math.hypot(self.rcg.nodes[nid].x - node.x,
-                            self.rcg.nodes[nid].y - node.y), nid)
-                for nid in self.rcg._open_ids
-                if nid in self.rcg.nodes
-            ),
-            key=lambda t: t[0],
-        )
-        for _, nid in nearest[: self.candidate_pool]:
-            candidates.add(nid)
-        if not candidates:
-            return self._escape_dead_end(current_id)
-
-        radius = max(self.rc, 0.5 * self.rcg.w)
-        best_id: Optional[int] = None
-        best_u = -1.0
-        for nid in candidates:
+                    local_ids.add(nid)
+        local_best_id: Optional[int] = None
+        local_best_u = -1.0
+        local_best_gain = 0.0
+        for nid in local_ids:
             n = self.rcg.nodes.get(nid)
             if n is None:
                 continue
@@ -88,15 +82,57 @@ class GoalSelector:
             u = float(gain) / (cost ** self.alpha)
             if n.lap_index == node.lap_index:
                 u *= self.same_lap_bonus
-            if u > best_u:
-                best_u = u
-                best_id = nid
+            if u > local_best_u:
+                local_best_u = u
+                local_best_gain = float(gain)
+                local_best_id = nid
 
-        if best_id is None:
-            # All nearby OPEN candidates would add zero new coverage — leave
-            # the local region via the dead-end escape (multi-target Dijkstra).
-            return self._escape_dead_end(current_id)
-        return best_id
+        # ── Tier 2: nearest OPEN nodes overall, excluding direct neighbors ─
+        far_best_id: Optional[int] = None
+        far_best_u = -1.0
+        far_best_gain = 0.0
+        if self.rcg._open_ids:
+            nearest = sorted(
+                (
+                    (math.hypot(self.rcg.nodes[nid].x - node.x,
+                                self.rcg.nodes[nid].y - node.y), nid)
+                    for nid in self.rcg._open_ids
+                    if (nid in self.rcg.nodes
+                        and nid not in local_ids
+                        and nid != current_id)
+                ),
+                key=lambda t: t[0],
+            )
+            for _, nid in nearest[: self.candidate_pool]:
+                n = self.rcg.nodes.get(nid)
+                if n is None:
+                    continue
+                gain = self.ogm.predict_coverage_gain(n.x, n.y, radius)
+                if gain <= 0:
+                    continue
+                cost = max(0.1, math.hypot(n.x - node.x, n.y - node.y))
+                u = float(gain) / (cost ** self.alpha)
+                if n.lap_index == node.lap_index:
+                    u *= self.same_lap_bonus
+                if u > far_best_u:
+                    far_best_u = u
+                    far_best_gain = float(gain)
+                    far_best_id = nid
+
+        # ── Commitment rule: prefer local unless far is *much* more informative
+        if local_best_id is not None:
+            if far_best_id is None:
+                return local_best_id
+            if local_best_gain >= self.commit_threshold * far_best_gain:
+                return local_best_id
+            return far_best_id
+
+        # No productive local candidate; take the best far one.
+        if far_best_id is not None:
+            return far_best_id
+
+        # Everything nearby is zero-gain or absent → leave via dead-end escape.
+        return self._escape_dead_end(current_id)
 
     def update_state(self, current_id: int, goal_id: int) -> None:
         """Algorithm 2: Update the state of the current node.

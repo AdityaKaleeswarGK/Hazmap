@@ -46,6 +46,18 @@ hazmap_node:
     prune_gain_min_cells: 15       # below this uncovered-cell count = redundant
     prune_keep_frontier: true      # never prune nodes bordering unknown
 
+    # ── Phase 1: local commitment heuristic + stuck-node safety ──────────
+    # commit_threshold: pick a direct lap neighbor unless a far candidate
+    # has > 1/commit_threshold times more uncovered area. Stops the long
+    # cross-map dashes (e.g. last sprint's 7m diagonals at steps 90→91 and
+    # 93→94). 0.30 ≈ need >3.3× more gain to deviate from local sweep.
+    # 1.0 = disable (pure utility argmax, Phase-0 behavior).
+    commit_threshold: 0.30
+    # Stuck-node patience: force-close an OPEN node selected this many
+    # times in a row when the rover can't actually reach within rc of it
+    # (the "node 111 at (-3.64,-3.88) infinite-loop" bug at end of run).
+    stuck_node_patience: 3
+
     # ── Next-Best-View mode (set coverage_mode: "nbv") ──────────────────
     # Surveillance / gas-mapping style coverage: the rover drives to the
     # viewpoint that *reveals* the most still-unseen area, crediting cells
