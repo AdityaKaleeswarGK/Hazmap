@@ -65,7 +65,7 @@ hazmap_node:
     # unreachable. Fixes the late-game pattern where the selector cycles
     # through a small ring of physically-unreachable frontier nodes,
     # preventing termination.
-    stuck_node_total_patience: 5
+    stuck_node_total_patience: 3
 
     # ── Phase 2: en-route node closing ───────────────────────────────────
     # After each traverse, close OPEN nodes the rover physically drove over
@@ -76,6 +76,28 @@ hazmap_node:
     # a small margin for the curved actual path vs the straight segment.
     enroute_close_enable: true
     enroute_close_radius: 0.40
+
+    # ── Unreachable-node pruning ─────────────────────────────────────────
+    # Close OPEN nodes lodged inside the costmap inflation (closer than
+    # unreachable_obstacle_margin to an obstacle). The rover can never reach
+    # these, so they cause cross-map ping-pong as the selector re-targets
+    # them — the main end-game overlap source (nodes 57/104/108 last sprint,
+    # all ~0.1-0.3 m from a wall). margin ≈ inflation_radius (0.30).
+    unreachable_prune_enable: true
+    unreachable_obstacle_margin: 0.28
+
+    # ── Coverage-efficiency early stop ───────────────────────────────────
+    # Stop chasing scattered fragments once the rover is mostly just dashing
+    # across covered map. Triggers when area-gained-per-metre over the last
+    # eff_window_size steps drops below eff_stop_threshold AND coverage is
+    # already past eff_stop_min_coverage. Robust to the stagnation detector
+    # being fooled by the coverage a long transit paints en route.
+    #   eff_stop_threshold units: m² covered per metre travelled. Full-swath
+    #   productive driving ≈ 0.5-0.75; 0.12 means "<~20% of travel is useful."
+    eff_stop_enable: true
+    eff_window_size: 6
+    eff_stop_threshold: 0.12
+    eff_stop_min_coverage: 80.0
 
     # ── Next-Best-View mode (set coverage_mode: "nbv") ──────────────────
     # Surveillance / gas-mapping style coverage: the rover drives to the

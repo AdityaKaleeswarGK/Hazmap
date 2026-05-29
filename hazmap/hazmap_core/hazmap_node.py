@@ -99,7 +99,7 @@ class HazMapNode(Node):
         # times across the whole inner loop (not just consecutively) without
         # ever closing, force-close it. Catches the "ring of unreachable
         # frontier nodes cycling forever" pattern at the end of a run.
-        self.declare_parameter('stuck_node_total_patience', 5)
+        self.declare_parameter('stuck_node_total_patience', 3)
         # ── Phase 2: en-route node closing ───────────────────────────────
         # After each traverse, CLOSE OPEN nodes the rover physically drove
         # over (within enroute_close_radius of the path segment) and that are
@@ -107,6 +107,21 @@ class HazMapNode(Node):
         # already covered in transit. Frontier nodes are kept.
         self.declare_parameter('enroute_close_enable', True)
         self.declare_parameter('enroute_close_radius', 0.40)
+        # ── Unreachable-node pruning ─────────────────────────────────────
+        # Close OPEN nodes lodged inside the costmap inflation (too close to
+        # an obstacle for the rover to ever reach). These never close on
+        # arrival and cause cross-map ping-pong as the selector keeps
+        # re-targeting them — the main end-game overlap source.
+        self.declare_parameter('unreachable_prune_enable', True)
+        self.declare_parameter('unreachable_obstacle_margin', 0.28)
+        # ── Coverage-efficiency early stop ───────────────────────────────
+        # Stop when area-gained-per-metre over a rolling window falls below
+        # eff_stop_threshold AND coverage already exceeds eff_stop_min_coverage.
+        # Robust to the stagnation detector being fooled by transit coverage.
+        self.declare_parameter('eff_stop_enable', True)
+        self.declare_parameter('eff_window_size', 6)
+        self.declare_parameter('eff_stop_threshold', 0.12)   # m² per metre
+        self.declare_parameter('eff_stop_min_coverage', 80.0)  # percent
         # ── Next-Best-View (coverage_mode: 'nbv') ────────────────────────
         self.declare_parameter('sensor_range', 0.0)          # 0 → fall back to rd
         self.declare_parameter('sensor_fov_deg', 360.0)
@@ -195,6 +210,22 @@ class HazMapNode(Node):
         ).value
         self.enroute_close_radius = float(
             self.get_parameter('enroute_close_radius').value
+        )
+        self.unreachable_prune_enable = self.get_parameter(
+            'unreachable_prune_enable'
+        ).value
+        self.unreachable_obstacle_margin = float(
+            self.get_parameter('unreachable_obstacle_margin').value
+        )
+        self.eff_stop_enable = self.get_parameter('eff_stop_enable').value
+        self.eff_window_size = max(
+            2, int(self.get_parameter('eff_window_size').value)
+        )
+        self.eff_stop_threshold = float(
+            self.get_parameter('eff_stop_threshold').value
+        )
+        self.eff_stop_min_coverage = float(
+            self.get_parameter('eff_stop_min_coverage').value
         )
         _sensor_range = self.get_parameter('sensor_range').value
         self.sensor_range = _sensor_range if _sensor_range > 0.0 else self.rd
@@ -528,6 +559,14 @@ class HazMapNode(Node):
         stagnation_count = 0
         prev_area_covered = 0.0
         prev_total_free = 0.0
+        # Coverage-efficiency early stop: rolling window of (area_gained,
+        # distance_travelled) per step. When coverage-per-metre drops low
+        # AND we're already substantially covered, the rover is just dashing
+        # across covered map to pick off scattered wall fragments — stop.
+        # This is robust to the stagnation detector being fooled by the
+        # coverage a long transit paints en route.
+        eff_window: list = []  # list of (area_gained, distance)
+        prev_eff_rx, prev_eff_ry = robot_x, robot_y
         # Track repeated selection of the same OPEN node when the rover
         # physically can't get within rc of it (e.g. corner nodes lodged
         # inside the costmap inflation). Force-close after N reselects.
@@ -783,6 +822,13 @@ class HazMapNode(Node):
                 prev_area_covered = area_covered
                 prev_total_free = total_free
 
+                # Coverage-efficiency tracking (area gained per metre moved).
+                eff_dist = math.hypot(rx - prev_eff_rx, ry - prev_eff_ry)
+                prev_eff_rx, prev_eff_ry = rx, ry
+                eff_window.append((max(0.0, area_growth), eff_dist))
+                if len(eff_window) > self.eff_window_size:
+                    eff_window.pop(0)
+
                 open_count = self.rcg.num_open
                 self.get_logger().info(
                     f'  Arrived. OPEN={open_count}, '
@@ -812,6 +858,29 @@ class HazMapNode(Node):
                     self.coverage_complete = True
                     self.coverage_running = False
                     break
+
+                # Coverage-efficiency early stop. Only consider it once we're
+                # past min coverage and the window is full, so a single far
+                # jump can't trigger it — sustained low yield does.
+                if (self.eff_stop_enable
+                        and pct >= self.eff_stop_min_coverage
+                        and len(eff_window) >= self.eff_window_size):
+                    win_area = sum(a for a, _ in eff_window)
+                    win_dist = sum(d for _, d in eff_window)
+                    efficiency = win_area / win_dist if win_dist > 1e-3 else 0.0
+                    if efficiency < self.eff_stop_threshold:
+                        self.get_logger().info(
+                            f'╔══════════════════════════════════╗\n'
+                            f'║   DIMINISHING RETURNS — STOPPING ║\n'
+                            f'║   {win_area:.2f} m² gained over '
+                            f'{win_dist:.1f} m (eff {efficiency:.3f} < '
+                            f'{self.eff_stop_threshold:.3f} m²/m)\n'
+                            f'║   final coverage {pct:.1f}%\n'
+                            f'╚══════════════════════════════════╝'
+                        )
+                        self.coverage_complete = True
+                        self.coverage_running = False
+                        break
 
                 if open_count == 0:
                     self.get_logger().info('All current RCG nodes visited.')
@@ -1765,6 +1834,17 @@ class HazMapNode(Node):
             # Never prune the node we're currently sitting on.
             if nid == self.current_node_id:
                 continue
+            # Unreachable-node prune: a node inside the costmap inflation
+            # (too close to an obstacle for the rover to reach) will never
+            # close — it just causes cross-map ping-pong as the selector
+            # re-targets it. Close it regardless of frontier status. This is
+            # the main fix for the wall-lodged-node end-game overlap.
+            if self.unreachable_prune_enable:
+                d_obs = self.ogm.nearest_obstacle_distance(node.x, node.y)
+                if d_obs < self.unreachable_obstacle_margin:
+                    self.rcg.set_node_state(nid, NodeState.CLOSED)
+                    pruned += 1
+                    continue
             if self.prune_keep_frontier and self.ogm.is_adjacent_to_unknown(
                 node.x, node.y, self.w
             ):
