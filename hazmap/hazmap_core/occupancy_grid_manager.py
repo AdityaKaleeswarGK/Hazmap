@@ -41,18 +41,6 @@ class OccupancyGridManager:
         self._observation_quality: Optional[np.ndarray] = None
         self._observation_views: List[Tuple[float, float, float, float, int]] = []
 
-        # ── Surface-inspection model ──────────────────────────────────────
-        # Per-OBSTACLE-cell best inspection quality (0..1) with which each
-        # obstacle surface cell has been *viewed* from within the camera's
-        # usable range band [min_view, max_view] and with line of sight.
-        # Distinct from _observation_quality (which records free cells seen).
-        # Drives the "orbit obstacles and view all faces" behavior: a
-        # candidate that would newly view un-inspected surface scores higher.
-        # Rebuilt from recorded surface-view history on map resize, like the
-        # other two grids.
-        self._surface_seen: Optional[np.ndarray] = None
-        self._surface_views: List[Tuple[float, float, float, float, float, int]] = []
-
     # ------------------------------------------------------------------
     # Update from ROS message
     # ------------------------------------------------------------------
@@ -97,7 +85,6 @@ class OccupancyGridManager:
             # world-coord centers, so coverage stats survive map jumps.
             self._rebuild_covered_map()
             self._rebuild_observation_quality()
-            self._rebuild_surface_seen()
         else:
             for wx, wy, r in self._pending_paints:
                 self._paint_circle_on_map(wx, wy, r)
@@ -591,170 +578,6 @@ class OccupancyGridManager:
                 gain += q - cur
         return gain
 
-    # ------------------------------------------------------------------
-    # Surface inspection (view obstacle faces from the camera range band)
-    # ------------------------------------------------------------------
-    def _rebuild_surface_seen(self) -> None:
-        """Allocate a fresh surface-quality grid and replay the view history."""
-        if self._data is None:
-            self._surface_seen = None
-            return
-        self._surface_seen = np.zeros(
-            (self._height, self._width), dtype=np.float32
-        )
-        for vx, vy, vr, vmin, vmax, vrays in self._surface_views:
-            self._cast_surface(vx, vy, vr, vmin, vmax, vrays, commit=True)
-
-    def mark_surface_seen(
-        self,
-        wx: float,
-        wy: float,
-        sensor_range: float,
-        min_view: float,
-        max_view: float,
-        n_rays: int = 72,
-    ) -> None:
-        """Raycast from a viewpoint and record every obstacle surface cell
-        hit within the usable camera band [min_view, max_view] (with line of
-        sight). Quality peaks mid-band and falls off toward the edges, so the
-        selector prefers viewpoints that frame a surface at a comfortable
-        distance rather than grazing it."""
-        self._surface_views.append(
-            (wx, wy, sensor_range, min_view, max_view, n_rays)
-        )
-        if self._data is None:
-            return  # map not ready; replayed on first update()
-        if (
-            self._surface_seen is None
-            or self._surface_seen.shape != (self._height, self._width)
-        ):
-            self._rebuild_surface_seen()
-            return
-        self._cast_surface(
-            wx, wy, sensor_range, min_view, max_view, n_rays, commit=True
-        )
-
-    def predict_surface_gain(
-        self,
-        wx: float,
-        wy: float,
-        sensor_range: float,
-        min_view: float,
-        max_view: float,
-        n_rays: int = 72,
-    ) -> float:
-        """New surface-inspection quality a viewpoint would add WITHOUT
-        committing: sum over viewable obstacle cells of max(0, q_new - q_cur).
-        Zero once every surface this viewpoint can see is already inspected —
-        which is what makes the rover move on / orbit to an un-inspected face."""
-        if self._data is None:
-            return 0.0
-        return self._cast_surface(
-            wx, wy, sensor_range, min_view, max_view, n_rays, commit=False
-        )
-
-    def _cast_surface(
-        self,
-        wx: float,
-        wy: float,
-        sensor_range: float,
-        min_view: float,
-        max_view: float,
-        n_rays: int,
-        commit: bool,
-    ) -> float:
-        """Shared surface raycast. Walks rays until they hit an obstacle (or
-        unknown / range limit). An obstacle cell hit at distance d within
-        [min_view, max_view] is the inspectable surface; its quality is a
-        triangular falloff that peaks at the band midpoint. 360° because the
-        rover can rotate the camera in place at a viewpoint."""
-        if self._data is None:
-            return 0.0
-        gx0, gy0 = self.world_to_grid(wx, wy)
-        if not self._in_bounds(gx0, gy0):
-            return 0.0
-        cap = min(sensor_range, max_view)
-        range_cells = max(1, int(cap / self._resolution))
-        n_rays = max(1, int(n_rays))
-        mid = 0.5 * (min_view + max_view)
-        half_span = max(1e-3, 0.5 * (max_view - min_view))
-
-        seen: dict = {} if not commit else None
-        for i in range(n_rays):
-            ang = 2.0 * math.pi * (i / n_rays)
-            ex = gx0 + int(round(range_cells * math.cos(ang)))
-            ey = gy0 + int(round(range_cells * math.sin(ang)))
-            for gx, gy in self._bresenham(gx0, gy0, ex, ey):
-                if gx == gx0 and gy == gy0:
-                    continue
-                if not self._in_bounds(gx, gy):
-                    break
-                d = math.hypot(gx - gx0, gy - gy0) * self._resolution
-                if d > cap:
-                    break
-                v = int(self._data[gy, gx])
-                if v == self.UNKNOWN:
-                    break  # cannot see past unknown space
-                if v >= self._free_threshold:
-                    # Obstacle surface cell. Credit it only if it sits within
-                    # the usable band; too close (out of focus / framing) or
-                    # beyond range does not count as a good inspection view.
-                    if d >= min_view:
-                        q = 1.0 - abs(d - mid) / half_span
-                        if q > 0.0:
-                            if commit:
-                                if q > self._surface_seen[gy, gx]:
-                                    self._surface_seen[gy, gx] = q
-                            else:
-                                prev = seen.get((gy, gx))
-                                if prev is None or q > prev:
-                                    seen[(gy, gx)] = q
-                    break  # ray stops at the obstacle either way
-        if commit:
-            return 0.0
-        gain = 0.0
-        for (gy, gx), q in seen.items():
-            cur = (
-                float(self._surface_seen[gy, gx])
-                if self._surface_seen is not None
-                else 0.0
-            )
-            if q > cur:
-                gain += q - cur
-        return gain
-
-    def surface_quality_grid_int8(self) -> Optional[np.ndarray]:
-        """Surface-inspection quality scaled to 0..100 int8 for RViz."""
-        if self._surface_seen is None:
-            return None
-        scaled = np.clip(self._surface_seen * 100.0, 0, 100)
-        return scaled.astype(np.int8)
-
-    def get_surface_statistics(
-        self, q_min: float, view_radius: float
-    ) -> Tuple[float, float, float]:
-        """Surface-inspection coverage: (percent, inspected_cells,
-        total_inspectable_cells). "Inspectable" = obstacle cells adjacent to
-        known free space (i.e. surfaces a camera could ever reach), within
-        view_radius logic handled by the caller. A surface counts inspected
-        once its quality reaches q_min."""
-        if self._data is None or self._surface_seen is None:
-            return 0.0, 0.0, 0.0
-        obstacles = self._data >= self._free_threshold
-        frees = (self._data >= 0) & (self._data < self._free_threshold)
-        # Obstacle cells adjacent to free space = reachable surfaces.
-        adj = np.zeros_like(obstacles)
-        adj[1:, :] |= frees[:-1, :]
-        adj[:-1, :] |= frees[1:, :]
-        adj[:, 1:] |= frees[:, :-1]
-        adj[:, :-1] |= frees[:, 1:]
-        inspectable = obstacles & adj
-        total = float(np.sum(inspectable))
-        if total == 0:
-            return 0.0, 0.0, 0.0
-        inspected = float(np.sum(inspectable & (self._surface_seen >= q_min)))
-        return 100.0 * inspected / total, inspected, total
-
     def get_observation_statistics(
         self, q_min: float
     ) -> Tuple[float, float, float]:
@@ -780,21 +603,13 @@ class OccupancyGridManager:
         scaled = np.clip(self._observation_quality * 100.0, 0, 100)
         return scaled.astype(np.int8)
 
-    def predict_coverage_gain(
-        self,
-        wx: float,
-        wy: float,
-        radius: float,
-        lambda_unknown: float = 0.0,
-    ) -> float:
-        """Information-aware gain: uncovered FREE cells in the disk plus
-        lambda_unknown times the unknown-boundary cells (free↔unknown
-        adjacencies) inside the disk. With lambda_unknown=0 this reduces to
-        a pure swath count (legacy behavior). With lambda_unknown>0 the
-        selector also rewards candidates sitting on an unknown frontier —
-        i.e. places where moving the rover *reveals* new map."""
+    def predict_coverage_gain(self, wx: float, wy: float, radius: float) -> int:
+        """Number of FREE cells within radius of (wx, wy) that are NOT yet
+        marked covered. Used by the utility-based goal selector to choose the
+        candidate that adds the most *new* swath, killing lap-priority bias
+        and redundant traversal of already-covered area."""
         if self._data is None:
-            return 0.0
+            return 0
         gx0, gy0 = self.world_to_grid(wx, wy)
         r_cells = max(1, int(radius / self._resolution))
         x_min = max(0, gx0 - r_cells)
@@ -802,7 +617,7 @@ class OccupancyGridManager:
         y_min = max(0, gy0 - r_cells)
         y_max = min(self._height, gy0 + r_cells + 1)
         if x_min >= x_max or y_min >= y_max:
-            return 0.0
+            return 0
         sub = self._data[y_min:y_max, x_min:x_max]
         free_mask = (sub >= 0) & (sub < self._free_threshold)
         if self._covered_map is not None:
@@ -810,93 +625,7 @@ class OccupancyGridManager:
         dy = np.arange(y_min, y_max) - gy0
         dx = np.arange(x_min, x_max) - gx0
         disk = (dy[:, None] ** 2 + dx[None, :] ** 2) <= r_cells * r_cells
-        swath = float(np.sum(free_mask & disk))
-        if lambda_unknown <= 0.0:
-            return swath
-        # Unknown-boundary cells: free cells adjacent to UNKNOWN, restricted
-        # to this disk. Reuse the global frontier mask so logic stays in one
-        # place (and the OGM keeps a single definition of "frontier").
-        fmask = self._frontier_mask()
-        if fmask is None:
-            return swath
-        unknown_boundary = float(
-            np.sum(fmask[y_min:y_max, x_min:x_max] & disk)
-        )
-        return swath + lambda_unknown * unknown_boundary
-
-    def find_frontier_cells_in_disk(
-        self, wx: float, wy: float, radius: float
-    ) -> int:
-        """Count uncovered free↔unknown boundary cells inside a disk —
-        used by RCG.reopen_stale_closed to detect when the post-close map
-        update has surfaced more to explore near a CLOSED node."""
-        if self._data is None:
-            return 0
-        fmask = self._frontier_mask()
-        if fmask is None:
-            return 0
-        gx0, gy0 = self.world_to_grid(wx, wy)
-        r_cells = max(1, int(radius / self._resolution))
-        x_min = max(0, gx0 - r_cells)
-        x_max = min(self._width, gx0 + r_cells + 1)
-        y_min = max(0, gy0 - r_cells)
-        y_max = min(self._height, gy0 + r_cells + 1)
-        if x_min >= x_max or y_min >= y_max:
-            return 0
-        dy = np.arange(y_min, y_max) - gy0
-        dx = np.arange(x_min, x_max) - gx0
-        disk = (dy[:, None] ** 2 + dx[None, :] ** 2) <= r_cells * r_cells
-        return int(np.sum(fmask[y_min:y_max, x_min:x_max] & disk))
-
-    def local_complexity(
-        self,
-        wx: float,
-        wy: float,
-        radius: float,
-        obstacle_weight: float = 0.5,
-        boundary_weight: float = 0.5,
-    ) -> float:
-        """Local environmental complexity C ∈ [0, 1] used to modulate
-        sampling density. High in cluttered or frontier-rich regions
-        (obstacles nearby, lots of unknown boundary to inspect), low in
-        big open free zones. Result drives density-modulated keep in the
-        sampler — dense nodes where it matters, sparse where it doesn't."""
-        if self._data is None:
-            return 0.0
-        gx0, gy0 = self.world_to_grid(wx, wy)
-        r_cells = max(1, int(radius / self._resolution))
-        x_min = max(0, gx0 - r_cells)
-        x_max = min(self._width, gx0 + r_cells + 1)
-        y_min = max(0, gy0 - r_cells)
-        y_max = min(self._height, gy0 + r_cells + 1)
-        if x_min >= x_max or y_min >= y_max:
-            return 0.0
-        sub = self._data[y_min:y_max, x_min:x_max]
-        dy = np.arange(y_min, y_max) - gy0
-        dx = np.arange(x_min, x_max) - gx0
-        disk = (dy[:, None] ** 2 + dx[None, :] ** 2) <= r_cells * r_cells
-        disk_area = float(np.sum(disk))
-        if disk_area <= 0.0:
-            return 0.0
-        obstacle_mask = sub >= self._free_threshold
-        obstacle_density = float(np.sum(obstacle_mask & disk)) / disk_area
-        fmask = self._frontier_mask()
-        if fmask is not None:
-            boundary_density = float(
-                np.sum(fmask[y_min:y_max, x_min:x_max] & disk)
-            ) / disk_area
-        else:
-            boundary_density = 0.0
-        # Obstacle density saturates fast (a wall in view ≈ "cluttered"); use
-        # a 3x scaling so 33% obstacles in the disk → C contribution = 1.0
-        # before clamping. Boundary density is rarer; keep linear-ish but
-        # scale ×6 since frontier ribbons are thin.
-        c_obs = min(1.0, 3.0 * obstacle_density)
-        c_bnd = min(1.0, 6.0 * boundary_density)
-        total = obstacle_weight + boundary_weight
-        if total <= 0.0:
-            return 0.0
-        return min(1.0, (obstacle_weight * c_obs + boundary_weight * c_bnd) / total)
+        return int(np.sum(free_mask & disk))
 
     # ------------------------------------------------------------------
     # Frontier clustering (reach non-lap-aligned openings)

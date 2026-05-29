@@ -42,12 +42,6 @@ class RCGNode:
     state: NodeState = NodeState.OPEN
     is_end_node: bool = False  # end node of its lap (terminates at obstacle/boundary)
     is_link_node: bool = False  # created by UpdateState to bridge uncovered segments
-    # Local frontier-cell count at the moment this node was last CLOSED.
-    # Compared against the current count by RCG.reopen_stale_closed to
-    # decide whether the map has revealed enough new unknown nearby to
-    # justify reopening this node for another visit.
-    frontier_at_close: int = 0
-    reopen_count: int = 0
     neighbors: Dict[str, List[int]] = field(
         default_factory=lambda: {
             "left": [],  # nodes on the left adjacent lap
@@ -195,61 +189,18 @@ class RCG:
         """
         Find all OPEN nodes within radius of (wx, wy) and mark them CLOSED.
         Returns a list of IDs for nodes that were closed in this call.
-        Also snapshots the local frontier-cell count at closure so
-        reopen_stale_closed can detect when the post-close map has revealed
-        enough new unknown nearby to justify another visit.
         """
         closed_ids = []
         r_sq = radius**2
-        snapshot_r = max(radius, self.w)
         for nid in list(self._open_ids):
             node = self.nodes.get(nid)
             if node is None:
                 continue
             dist_sq = (node.x - wx) ** 2 + (node.y - wy) ** 2
             if dist_sq <= r_sq:
-                node.frontier_at_close = self.ogm.find_frontier_cells_in_disk(
-                    node.x, node.y, snapshot_r,
-                )
                 self.set_node_state(nid, NodeState.CLOSED)
                 closed_ids.append(nid)
         return closed_ids
-
-    def reopen_stale_closed(
-        self,
-        growth_threshold: float = 1.5,
-        min_new_frontier: int = 4,
-        max_reopens_per_node: int = 2,
-        radius: Optional[float] = None,
-    ) -> List[int]:
-        """Flip CLOSED nodes back to OPEN when their local frontier has
-        grown materially since closure — i.e. the OGM update revealed more
-        unknown around them that wasn't visible the first time. Bounded by
-        max_reopens_per_node so a single node can't ping-pong forever, and
-        min_new_frontier so trivial fluctuations don't trigger.
-
-        Returns the list of node ids that were reopened."""
-        if self.ogm is None or not self.ogm.ready:
-            return []
-        r = max(radius if radius is not None else self.w, self.w)
-        reopened: List[int] = []
-        for nid in list(self._closed_ids):
-            node = self.nodes.get(nid)
-            if node is None:
-                continue
-            if node.reopen_count >= max_reopens_per_node:
-                continue
-            current = self.ogm.find_frontier_cells_in_disk(node.x, node.y, r)
-            baseline = max(1, node.frontier_at_close)
-            if (current - node.frontier_at_close) < min_new_frontier:
-                continue
-            if current < growth_threshold * baseline:
-                continue
-            node.reopen_count += 1
-            node.frontier_at_close = current
-            self.set_node_state(nid, NodeState.OPEN)
-            reopened.append(nid)
-        return reopened
 
     # ------------------------------------------------------------------
     # Query / Analysis

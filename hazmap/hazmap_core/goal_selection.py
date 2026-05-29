@@ -25,27 +25,14 @@ class GoalSelector:
         rc: float = 0.30,
         alpha: float = 1.0,
         candidate_pool: int = 12,
-        lambda_unknown: float = 0.0,
-        lambda_surface: float = 0.0,
-        surface_sensor_range: float = 3.0,
-        surface_min_view: float = 1.0,
-        surface_max_view: float = 3.0,
-        surface_n_rays: int = 48,
+        same_lap_bonus: float = 1.25,
     ):
         self.rcg = rcg
         self.ogm = ogm
         self.rc = rc
         self.alpha = alpha
         self.candidate_pool = candidate_pool
-        self.lambda_unknown = lambda_unknown
-        # Surface-inspection term: rewards candidates that would newly view
-        # un-inspected obstacle faces from the camera's usable range band.
-        # 0 disables (pure coverage). >0 makes the rover orbit obstacles.
-        self.lambda_surface = lambda_surface
-        self.surface_sensor_range = surface_sensor_range
-        self.surface_min_view = surface_min_view
-        self.surface_max_view = surface_max_view
-        self.surface_n_rays = surface_n_rays
+        self.same_lap_bonus = same_lap_bonus
         self.retreat_nodes: Set[int] = set()
 
     def select_goal_node(self, current_id: int) -> Optional[int]:
@@ -94,21 +81,13 @@ class GoalSelector:
             n = self.rcg.nodes.get(nid)
             if n is None:
                 continue
-            gain = self.ogm.predict_coverage_gain(
-                n.x, n.y, radius, lambda_unknown=self.lambda_unknown,
-            )
-            if self.lambda_surface > 0.0:
-                gain += self.lambda_surface * self.ogm.predict_surface_gain(
-                    n.x, n.y,
-                    self.surface_sensor_range,
-                    self.surface_min_view,
-                    self.surface_max_view,
-                    n_rays=self.surface_n_rays,
-                )
+            gain = self.ogm.predict_coverage_gain(n.x, n.y, radius)
             if gain <= 0:
                 continue
             cost = max(0.1, math.hypot(n.x - node.x, n.y - node.y))
             u = float(gain) / (cost ** self.alpha)
+            if n.lap_index == node.lap_index:
+                u *= self.same_lap_bonus
             if u > best_u:
                 best_u = u
                 best_id = nid
