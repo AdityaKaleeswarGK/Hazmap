@@ -1,6 +1,6 @@
 # HazMap — Coverage Path Planning with C*
 
-Autonomous coverage path planning for TurtleBot3 on **ROS 2 Humble**, built around a modified **C\*** algorithm. The robot explores an unknown environment incrementally, building a Reachability Connectivity Graph (RCG) as the map grows, and drives the robot along boustrophedon laps until the full navigable area is covered.
+Autonomous coverage of unknown area built on **ROS 2 Humble**, built around a modified **C\*** algorithm. The robot explores an unknown environment incrementally, building a Reachability Connectivity Graph (RCG) as the map grows, and drives the robot along boustrophedon laps until the full navigable area is covered.
 
 ---
 
