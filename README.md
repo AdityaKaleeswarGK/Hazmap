@@ -1,16 +1,24 @@
-# HazMap — Coverage Path Planning with C*
+# Hazpatrol — Surveillance Path Planning with C*
 
-Autonomous coverage of unknown area built on **ROS 2 Humble**, built around a modified **C\*** algorithm. The robot explores an unknown environment incrementally, building a Reachability Connectivity Graph (RCG) as the map grows, and drives the robot along boustrophedon laps until the full navigable area is covered.
+**Pardon the naming;it still refers to the previous name Hazmap didnt update it everywhere cause im just lazy to do it**
+
+Autonomous **surveillance** path planning for TurtleBot3 on **ROS 2 Humble**, built around a modified **C\*** algorithm. Rather than exhaustively lawnmower-covering every square metre, the robot *surveys* an unknown environment: it concentrates its observation effort on cluttered, feature-rich regions and samples open empty space sparsely. It builds a Reachability Connectivity Graph (RCG) incrementally as the map grows and sweeps the navigable area in boustrophedon laps.
+
+The intended deployment is gas / hazard monitoring. The patrol is designed to run inside a **GADEN** gas-dispersion simulation; when auto-start is enabled the node waits for GADEN's `/odor_value` and `/wind_value` services before beginning a sweep. (GADEN currently provides the operating environment — the gas plume the robot patrols through — but the planner does not yet steer goal selection from live concentration/wind readings; surveillance behaviour comes from the adaptive sampling below.)
+
+
 
 ---
 
 ## Algorithm Overview
 
-The implementation follows the C\* coverage algorithm with several practical modifications for real-world robot operation.
+The implementation follows the C\* coverage algorithm with several practical modifications, re-tuned so the sweep behaves like a surveillance patrol rather than exhaustive floor coverage.
 
-### 1. Progressive Sampling
+### 1. Progressive Sampling (surveillance-weighted)
 
-At each step, the robot samples the newly revealed free space within its detection radius (`rd`). Samples are placed on parallel laps spaced `w` metres apart, oriented along the chosen sweep axis. Only samples adjacent to unknown space or obstacles (i.e., on the frontier) are retained — this keeps the graph sparse and focused on regions that still need covering.
+At each step, the robot samples the newly revealed free space within its detection radius (`rd`). Samples are placed on parallel laps spaced `w` metres apart, oriented along the chosen sweep axis. Only samples adjacent to unknown space or obstacles (i.e., on the frontier) are retained — this keeps the graph sparse and focused on regions that still need visiting.
+
+**Adaptive frontier density** is what makes this a surveillance sweep rather than a lawnmower one. A sample is classified as "open" when the nearest obstacle is at least `density_open_distance` away; in those open, empty regions only a `density_keep_floor` fraction of lap samples are kept (default 0.40 → ~60% dropped). Cluttered, feature-rich regions stay densely sampled. The robot therefore spends its time observing where there is structure to inspect and skims across empty floor, instead of dutifully ticking off every node in an open room. Set `density_keep_floor = 1.0` to fall back to uniform coverage sampling.
 
 ### 2. Reachability Connectivity Graph (RCG)
 
@@ -38,30 +46,32 @@ The occupancy grid manager tracks which free cells have been visited. A cell is 
 
 ### 5. Termination
 
-The run stops under any of three conditions:
-- **Target reached**: coverage exceeds 95% of known free space.
-- **Stagnation**: neither covered area nor discovered free area has grown meaningfully in the last 8 arrivals.
-- **Diminishing returns**: coverage-per-metre-travelled over a rolling window falls below threshold while coverage is already above 80%.
+The patrol stops under any of three conditions:
+- **Target reached**: observed area exceeds 95% of known free space.
+- **Stagnation**: neither observed area nor discovered free area has grown meaningfully in the last 8 arrivals.
+- **Diminishing returns**: area-observed-per-metre-travelled over a rolling window falls below threshold while observed area is already above 80%.
 
 A safety-net frontier-cluster search runs when no lap samples remain but the map still has unexplored openings — this catches narrow passages and off-axis gaps the lap sampler misses.
+
+> Throughout, "coverage" in the code and parameter names refers to *area the robot has observed/passed within `rc` of* — the surveillance footprint, not a guarantee of exhaustive floor coverage.
 
 ---
 
 ## Architecture
 
 ```
-                        ┌─────────────────────────────────────────────────┐
-                        │                  HazMapNode                     │
-                        │           (hazmap_core/hazmap_node.py)          │
-                        │                                                 │
-   /map ───────────────►│  ┌──────────────────────┐                      │
-   /odom ──────────────►│  │ OccupancyGridManager │                      │
-   /scan ──────────────►│  │                      │  frontier queries     │
+                        ┌────────────────────────────────────────────────┐
+                        │                  hazpatrolNode                 │
+                        │           (hazmap_core/hazmap_node.py)         │
+                        │                                                │
+   /map ───────────────►   ┌──────────────────────┐                      │
+   /odom ──────────────►   │ OccupancyGridManager │                      │
+   /scan ──────────────►   │                      │  frontier queries    │
                         │  │  • free/unknown/occ  │◄─────────────────┐   │
                         │  │  • coverage tracking │                  │   │
                         │  │  • obstacle distance │                  │   │
                         │  └──────────┬───────────┘                  │   │
-                        │             │ grid state                    │   │
+                        │             │ grid state                   │   │
                         │  ┌──────────▼───────────┐                  │   │
                         │  │  ProgressiveSampler  │                  │   │
                         │  │                      │  (x,y,lap,pos)   │   │
@@ -94,8 +104,8 @@ A safety-net frontier-cluster search runs when no lap samples remain but the map
                         └────────────────────────────┼─────────────────────────┘
                                                      │
                                           ┌──────────▼──────────┐
-                                          │    TurtleBot3 +      │
-                                          │    Nav2 + SLAM       │
+                                          │    TurtleBot3 +     │
+                                          │    Nav2 + SLAM      │
                                           └─────────────────────┘
 ```
 
@@ -115,6 +125,7 @@ A safety-net frontier-cluster search runs when no lap samples remain but the map
 - **TurtleBot3 Burger** (example platform; any differential-drive robot works)
 - **Nav2** for global path following
 - **SLAM Toolbox** for online mapping
+- **GADEN** gas-dispersion simulator for the operating environment (provides `/odor_value` and `/wind_value`; launched separately)
 - Navigation: Nav2 `NavigateToPose` / `NavigateThroughPoses`, with optional direct velocity control for short collision-free hops
 
 ---
@@ -168,12 +179,14 @@ export TURTLEBOT3_MODEL=burger
 # Launch Gazebo + SLAM Toolbox + Nav2 + HazMap + RViz
 ros2 launch hazmap hazmap.launch.py
 
-# In another terminal — start coverage
+# In another terminal — start the surveillance sweep
 ros2 service call /hazmap/start_coverage std_srvs/srv/Trigger
 
 # Stop early (saves visit log)
 ros2 service call /hazmap/stop_coverage std_srvs/srv/Trigger
 ```
+
+The launch file brings up Gazebo (in the `c_star_world`), SLAM, Nav2, the HazMap node and RViz — it does **not** start GADEN. Run your GADEN gas-dispersion launch separately. With `auto_start_coverage: true`, HazMap waits until `/map`, odometry, the Nav2 `navigate_to_pose` server, **and** GADEN's `/odor_value` + `/wind_value` services are all available, then begins the sweep on its own — no manual `start_coverage` call needed. With auto-start off (the default), the GADEN gate does not apply and you trigger the sweep manually.
 
 ---
 
@@ -185,6 +198,9 @@ ros2 service call /hazmap/stop_coverage std_srvs/srv/Trigger
 | `rc` | 0.30 m | Coverage radius per waypoint |
 | `rd` | 3.0 m | Detection / sampling radius |
 | `sweep_direction` | `"x"` | `"x"` = vertical laps, `"y"` = horizontal |
+| `density_keep_floor` | 0.40 | Fraction of lap samples kept in open space (1.0 = uniform coverage; 0.0 = strip all open-area nodes) |
+| `density_open_distance` | 1.5 m | Distance from nearest obstacle for a sample to count as "open" |
+| `auto_start_coverage` | `false` | Auto-begin the sweep once `/map`, odom, Nav2 and GADEN services are ready |
 | `use_hybrid_navigation` | `false` | Enable direct velocity control for short hops |
 | `commit_threshold` | 0.30 | Local-commitment bias (lower = stronger local preference) |
 | `path_blocked_penalty` | 3.0 | Cost multiplier for collision-blocked candidates |
